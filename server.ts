@@ -37,7 +37,16 @@ async function startServer() {
 
   sapEccTableGateway.setLiveTableReader(nativeEccRfcTableReader);
 
-  const { processSapQuery } = await import("./services/geminiService");
+  const { processSapQuery, isSimulatedTool } = await import("./services/geminiService");
+  const { buildAnswerProvenance } = await import("./services/answerProvenance");
+
+  // Persistent audit trail (one JSON line per answered question, one file per day).
+  const auditDir = path.resolve(process.cwd(), 'logs', 'audit');
+  const appendAudit = (entry: Record<string, unknown>) => {
+    fs.promises.mkdir(auditDir, { recursive: true })
+      .then(() => fs.promises.appendFile(path.join(auditDir, `audit-${String(entry.timestamp).slice(0, 10)}.jsonl`), JSON.stringify(entry) + '\n', 'utf-8'))
+      .catch(err => console.error('[AUDIT LOG WRITE ERROR]', err));
+  };
 
   // Bypass Node TLS unauthorized certificate rejection for S/4HANA OData connection
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -77,7 +86,7 @@ async function startServer() {
   const eccHost = process.env.SAP_ECC_HOST || 's1.myerplabs.com';
   const eccPort = process.env.SAP_ECC_PORT || '8085';
   const eccUser = process.env.SAP_ECC_USER || 'AI_AGENT';
-  const eccPwd = process.env.SAP_ECC_PASSWORD || 'Welcome$77';
+  const eccPwd = process.env.SAP_ECC_PASSWORD || '';
   const eccBasicAuth = 'Basic ' + Buffer.from(`${eccUser}:${eccPwd}`).toString('base64');
 
   app.use(
@@ -111,6 +120,7 @@ async function startServer() {
 
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Transfer-Encoding', 'chunked');
+    const startedAt = Date.now();
 
     try {
       const response = await processSapQuery(
@@ -133,6 +143,21 @@ async function startServer() {
         toolCount: Array.isArray(response.toolResults) ? response.toolResults.length : 0
       };
       console.log('[AUDIT LOG]', JSON.stringify(auditEntry));
+      let provenance = null;
+      try {
+        provenance = buildAnswerProvenance(typeof query === 'string' ? query : '', response, Date.now() - startedAt, isSimulatedTool);
+      } catch (provErr) {
+        console.error('[ANSWER PROVENANCE ERROR]', provErr);
+      }
+      appendAudit({
+        ...auditEntry,
+        status: 'answered',
+        durationMs: Date.now() - startedAt,
+        answerKind: provenance?.kind,
+        channel: provenance?.channel,
+        records: provenance?.records,
+        tools: Array.isArray(response.toolResults) ? [...new Set(response.toolResults.map((r: any) => r?.toolName).filter(Boolean))] : []
+      });
       res.write(JSON.stringify({
         type: 'agent_update',
         name: 'Audit Log',
@@ -142,17 +167,48 @@ async function startServer() {
       res.write(JSON.stringify({ 
         type: 'result', 
         text: response.text, 
-        toolResults: response.toolResults 
+        toolResults: response.toolResults,
+        provenance
       }) + '\n');
       res.end();
     } catch (error) {
       console.error("Backend error in processSapQuery routing:", error);
+      appendAudit({
+        timestamp: new Date().toISOString(),
+        userRole,
+        backendTarget,
+        query: typeof query === 'string' ? query.slice(0, 300) : '',
+        status: 'failed',
+        durationMs: Date.now() - startedAt,
+        error: String((error as any)?.message || error).slice(0, 300)
+      });
       res.write(JSON.stringify({
         type: 'result',
         text: "I encountered an error connecting to the SAP Core Gateway. Please verify the environment credentials.",
         toolResults: []
       }) + '\n');
       res.end();
+    }
+  });
+
+  // Recent audit trail entries (newest first) for administrators.
+  app.get("/api/audit/recent", async (req, res) => {
+    if (req.get('x-user-role') !== 'Administrator') return res.status(403).json({ error: 'Administrator role required.' });
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 500);
+    try {
+      const files = (await fs.promises.readdir(auditDir).catch(() => [] as string[])).filter(f => /^audit-\d{4}-\d{2}-\d{2}\.jsonl$/.test(f)).sort().reverse();
+      const entries: unknown[] = [];
+      for (const f of files) {
+        const lines = (await fs.promises.readFile(path.join(auditDir, f), 'utf-8')).split('\n').filter(Boolean).reverse();
+        for (const line of lines) {
+          try { entries.push(JSON.parse(line)); } catch { /* skip malformed line */ }
+          if (entries.length >= limit) break;
+        }
+        if (entries.length >= limit) break;
+      }
+      res.json({ entries });
+    } catch (err) {
+      res.status(500).json({ error: 'Audit trail could not be read.' });
     }
   });
 

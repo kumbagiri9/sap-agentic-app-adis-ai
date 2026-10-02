@@ -13453,7 +13453,7 @@ const SIMULATED_TOOL_NAMES = new Set([
   'getMmAutonomousCopilotReport', 'getFicoAutonomousCopilotReport', 'getFinancialCloseAutomationReport', 'getAccountsPayableAutomationReport',
   'getAccountsReceivableAutomationReport', 'getCostControllingAutomationReport', 'getProcurementMetrics'
 ]);
-const isSimulatedTool = (name?: string) => !!name && (SIMULATED_TOOL_NAMES.has(name) || name.startsWith('get_hr_hcm_'));
+export const isSimulatedTool = (name?: string) => !!name && (SIMULATED_TOOL_NAMES.has(name) || name.startsWith('get_hr_hcm_'));
 
 // Maps a free-form question to one live intent of the Basis/ABAP/Security/BW/TM live services by meaning, not keywords.
 async function routeQuestionToLiveIntent(query: string): Promise<LiveIntentEntry | null> {

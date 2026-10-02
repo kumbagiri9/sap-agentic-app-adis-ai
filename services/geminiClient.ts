@@ -23,7 +23,7 @@ export async function processSapQuery(
   images?: { name: string; type: string; data: string }[],
   onAgentUpdate?: (agent: string, action: string) => void,
   backendTarget: SapBackendTarget = 'BOTH'
-): Promise<{ text: string; toolResults: ToolResult[] }> {
+): Promise<{ text: string; toolResults: ToolResult[]; provenance?: any }> {
   try {
     const cleanHistory = sanitizeHistory(history);
 
@@ -64,6 +64,7 @@ export async function processSapQuery(
     let buffer = '';
     let finalText = '[LIVE_SAP_UNAVAILABLE] SAP Connection Gateway Timeout.';
     let finalToolResults: ToolResult[] = [];
+    let finalProvenance: any = undefined;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -84,6 +85,7 @@ export async function processSapQuery(
           } else if (data.type === 'result') {
             finalText = data.text;
             finalToolResults = data.toolResults || [];
+            finalProvenance = data.provenance || undefined;
           }
         } catch (err) {
           console.error('Error parsing streaming line:', trimmedLine, err);
@@ -100,6 +102,7 @@ export async function processSapQuery(
           if (data.type === 'result') {
             finalText = data.text;
             finalToolResults = data.toolResults || [];
+            finalProvenance = data.provenance || undefined;
           }
         } catch {}
       }
@@ -126,7 +129,7 @@ export async function processSapQuery(
       }
     }
 
-    return { text: finalText, toolResults: finalToolResults };
+    return { text: finalText, toolResults: finalToolResults, provenance: finalProvenance };
   } catch (error) {
     console.error("Error calling backend Gemini API:", error);
     return {

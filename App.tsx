@@ -228,6 +228,7 @@ import { SelfHealingApprovalModal, HealingProposal } from './components/SelfHeal
 import { SapEmbeddedWorkspace, SapTab } from './components/SapEmbeddedWorkspace';
 import { idocService } from './services/idocService';
 import { LiveSapUnavailableCard } from './components/LiveSapUnavailableCard';
+import { AnswerTrustPanel } from './components/AnswerTrustPanel';
 import { sapOperatingModeManager } from './services/sapService';
 
 const isLiveSapUnavailableMessage = (content?: string) =>
@@ -1409,6 +1410,7 @@ const App: React.FC = () => {
             role: 'assistant', 
             content: response.text, 
             toolResults: response.toolResults, 
+            provenance: response.provenance,
             timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) 
           }]);
           setIsTyping(false); 
@@ -1458,6 +1460,7 @@ const App: React.FC = () => {
       role: 'assistant', 
       content: response.text, 
       toolResults: response.toolResults, 
+      provenance: response.provenance,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) 
     }]);
     
@@ -3069,6 +3072,7 @@ const App: React.FC = () => {
                                       {msg.content}
                                     </ReactMarkdown>
                                   </div>
+                                  <AnswerTrustPanel provenance={msg.provenance} onAsk={(q) => handleSubmit(undefined, q)} />
                                 </div>
                               );
                             })()}
