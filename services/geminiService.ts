@@ -22,6 +22,7 @@ import { classifyBasisLiveIntent, buildBasisLiveReport } from "./basisLiveDataSe
 import { classifySecurityLiveIntent, buildSecurityLiveReport } from "./securityLiveDataService";
 import { classifyBwLiveIntent, buildBwLiveReport } from "./bwLiveDataService";
 import { classifyTmLiveIntent, buildTmLiveReport } from "./tmLiveDataService";
+import { liveIntentCatalogPrompt, resolveLiveIntent, type LiveIntentEntry } from "./liveIntentCatalog";
 import { classifyAbapLiveIntent, buildAbapLiveReport, classifyAbapCodeGenTarget, pickAbapCodeGenTarget, validateGeneratedAbapCode, classifyAbapSpecRequest, collectAbapSpecFacts, verifyStandardCandidates, renderAbapSpecDocument, abapSpecSections, type AbapSection, type AbapSpecNarrative } from "./abapLiveDataService";
 import { ProcessMiningService } from "./processMiningService";
 import { basisAdminService } from "./basisAdminService";
@@ -13366,7 +13367,127 @@ function synthesizeLiveDataSummary(results: ToolResult[]): string | null {
   return null;
 }
 
+// Legacy LLM tools whose handlers return simulated dashboard/demo content instead of live system data.
+const SIMULATED_TOOL_NAMES = new Set([
+  'getSapBasisSystemMetrics', 'triggerSapSystemHealthCheck', 'executeAutonomousBasisAgent', 'getBasisExecutiveQuestionAnswer', 'getBasisExecutiveQueryInsightsReport',
+  'getAbapDumps', 'getSapAgents', 'getSproConfigurations', 'getSecurityAuditLogs', 'getSecurityExecutiveQuestionAnswer', 'getSecurityExecutiveQueryInsightsReport',
+  'getTmExecutiveQuestionAnswer', 'getTmExecutiveQueryInsightsReport', 'getTmAutonomousCopilotReport', 'getTmTransportationControlTower', 'getTmAutonomousExceptionManagement',
+  'getTmPredictiveTransportationAi', 'getTmAutonomousTendering', 'getTmFreightSettlementIntelligence', 'getMultiAgentTmArchitecture', 'findBestCarrierForLoad',
+  'consolidateOutboundShipments', 'analyzeTransportationCostIntelligence', 'analyzeLateShipment', 'getTransportationMetrics',
+  'getPpExecutiveQuestionAnswer', 'getPpExecutiveQueryInsightsReport', 'getPpAutonomousCopilotReport', 'getQmExecutiveQuestionAnswer', 'getQmExecutiveQueryInsightsReport',
+  'getHrExecutiveQuestionAnswer', 'getHrExecutiveQueryInsightsReport', 'getEhsExecutiveQuestionAnswer', 'getEhsExecutiveQueryInsightsReport',
+  'getMmAutonomousCopilotReport', 'getFicoAutonomousCopilotReport', 'getFinancialCloseAutomationReport', 'getAccountsPayableAutomationReport',
+  'getAccountsReceivableAutomationReport', 'getCostControllingAutomationReport', 'getProcurementMetrics'
+]);
+const isSimulatedTool = (name?: string) => !!name && (SIMULATED_TOOL_NAMES.has(name) || name.startsWith('get_hr_hcm_'));
+
+// Maps a free-form question to one live intent of the Basis/ABAP/Security/BW/TM live services by meaning, not keywords.
+async function routeQuestionToLiveIntent(query: string): Promise<LiveIntentEntry | null> {
+  try {
+    const resp = await generateContentWithFallback({
+      model: 'gemini-3.1-flash-lite',
+      contents: [{ role: 'user', parts: [{ text: `Question: "${query}"\n\nCatalog (MODULE:INTENT | example questions):\n${liveIntentCatalogPrompt()}` }] }],
+      config: {
+        responseMimeType: 'application/json',
+        systemInstruction: 'You route SAP user questions to live-data intents. The catalog only covers Basis/system administration, ABAP development objects, user security/authorizations, BW/analytics and Transportation Management. '
+          + 'Step 1: name the business object the user asks about (e.g. "G/L journal entries", "background jobs", "freight units", "user logons"). '
+          + 'Step 2: pick the catalog entry whose example questions ask for the same information about that same business object; synonyms, paraphrases, abbreviations, typos and different word order count. '
+          + 'A different object that merely sounds related does NOT count: finance postings/GL/journal entries/costs/budgets/invoices are not alerts, update errors, firefighter sessions or transportation spend; generic company costs are not freight costs. '
+          + 'Step 3: set same_information=true only if the chosen entry would directly answer the user question. If unsure, use NONE. '
+          + 'Return JSON only: {"asked_object":"...","match":"MODULE:INTENT" or "NONE","match_object":"...","same_information":true|false}.'
+      }
+    });
+    const raw = (resp.text || '').trim();
+    const parsed = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1)) || {};
+    const match = String(parsed.match || '');
+    if (parsed.same_information !== true || !match || match.toUpperCase() === 'NONE' || !match.includes(':')) return null;
+    const [module, intent] = match.split(':');
+    return resolveLiveIntent(module.trim(), intent.trim());
+  } catch (e: any) {
+    console.error('[LIVE INTENT ROUTER ERROR]', e?.message || e);
+    return null;
+  }
+}
+
+async function runRoutedLiveIntent(entry: LiveIntentEntry, query: string): Promise<{ text: string; toolResults: ToolResult[] }> {
+  const toMm = (sections: any[], toolName: string, agentName: string): ToolResult[] => sections.map(s => ({
+    type: 'mm_live_report', toolName, agentName,
+    data: { reportTitle: s.title, summaryStats: s.summaryStats || [], columns: s.columns, rows: s.rows, note: s.note || '', ...(s.pageSize ? { pageSize: s.pageSize } : {}), ...(s.downloadable ? { downloadable: true } : {}) }
+  }));
+  let report: { text: string; sections: any[]; assess: boolean; persona?: string; context?: string };
+  let toolResults: ToolResult[];
+  switch (entry.module) {
+    case 'BASIS': report = await buildBasisLiveReport(entry.intent as any, query); toolResults = toMm(report.sections, 'basisLiveData', AGENTS.BASIS_LIVE_AGENT.name); break;
+    case 'SECURITY': report = await buildSecurityLiveReport(entry.intent as any, query); toolResults = toMm(report.sections, 'securityLiveData', AGENTS.SECURITY_LIVE_AGENT.name); break;
+    case 'BW': report = await buildBwLiveReport(entry.intent as any, query); toolResults = toMm(report.sections, 'bwLiveData', AGENTS.BW_LIVE_AGENT.name); break;
+    case 'TM': report = await buildTmLiveReport(entry.intent as any, query); toolResults = toMm(report.sections, 'tmLiveData', AGENTS.TM_LIVE_AGENT.name); break;
+    default: { const a = await buildAbapLiveReport(entry.intent as any, query); report = a; toolResults = a.sections.map(abapSectionToolResult); }
+  }
+  let text = report.text;
+  if (report.assess && report.sections.some(s => s.rows?.length)) {
+    try {
+      const evidence = report.sections.map(s => ({ title: s.title, stats: s.summaryStats, rows: s.rows.slice(0, 40), note: s.note }));
+      const assessment = await generateContentWithFallback({
+        model: 'gemini-3.1-flash-lite',
+        contents: [{ role: 'user', parts: [{ text: `Question: "${query}"\n\nLive SAP evidence (JSON):\n${JSON.stringify(evidence).slice(0, 24000)}${report.context ? `\n\nReal ABAP source read live:\n${report.context}` : ''}` }] }],
+        config: { systemInstruction: `${report.persona || 'You are a senior SAP expert. Answer in 3-6 sentences.'} Start with "Based on this live data,". Use ONLY the evidence; never invent objects, numbers or causes.` }
+      });
+      if (assessment.text?.trim()) text = `${text}\n\n${assessment.text.trim()}`;
+    } catch (e: any) {
+      console.error('[ROUTED LIVE ASSESSMENT ERROR]', e?.message || e);
+    }
+  }
+  return { text, toolResults };
+}
+
+// Recovery for questions the keyword intercepts and the tool-calling model could not answer from live data:
+// first by meaning against the live intent catalog, then by planning a read-only SQL query on the live database.
+async function recoverWithLiveIntelligence(query: string, onAgentUpdate?: (agent: string, action: string) => void): Promise<{ text: string; toolResults: ToolResult[] } | null> {
+  onAgentUpdate?.('Intent + Entity Resolution', 'No live answer yet — resolving the question\'s intent against the live data services...');
+  const entry = await routeQuestionToLiveIntent(query);
+  if (entry) {
+    onAgentUpdate?.('Agent Router', `Understood as ${entry.module} intent ${entry.intent} (like "${entry.examples[0]}") — reading live data...`);
+    const routed = await runRoutedLiveIntent(entry, query);
+    if (routed.text?.trim() || routed.toolResults.length) return routed;
+  }
+  onAgentUpdate?.('Agent Router', 'Planning a read-only query on the live S/4HANA database for this question...');
+  const hana = await buildHanaDbIntelligenceReport(query, onAgentUpdate);
+  if (hana.toolResults.some(r => r.type === 'hana_db_intelligence_report' && Array.isArray(r.data?.rows) && r.data.rows.length > 0)) return hana;
+  return null;
+}
+
 export async function processSapQuery(
+  query: string,
+  userRole: UserRole,
+  history: Message[] = [],
+  onAgentUpdate?: (agent: string, action: string) => void,
+  images?: { name: string; type: string; data: string }[],
+  backendTarget: SapBackendTarget = 'BOTH'
+): Promise<{ text: string; toolResults: ToolResult[] }> {
+  const result = await processSapQueryCore(query, userRole, history, onAgentUpdate, images, backendTarget);
+  // A keyword intercept answered "not available live": check whether the question's meaning maps to a live data service.
+  const onlyUnavailable = result.toolResults.length > 0 && result.toolResults.every(r => r.type === 'fico_service_unavailable');
+  if (!onlyUnavailable || backendTarget === 'ECC' || (images && images.length > 0)) return result;
+  // Only re-route within the module whose disclosure fired (the catalog has no FI/CO/SD/MM/EWM live intents).
+  const disclosureTool = result.toolResults[0]?.toolName || '';
+  const disclosureModule = /^queryTm/.test(disclosureTool) ? 'TM'
+    : /Bw|datasphere/i.test(disclosureTool) ? 'BW'
+    : /^(basisAutonomousAction|liveGatewayHealthCheck|osUtilizationHistory)$/.test(disclosureTool) ? 'BASIS'
+    : disclosureTool === 'queryAdtRaw' ? 'ABAP' : null;
+  if (!disclosureModule) return result;
+  try {
+    const entry = await routeQuestionToLiveIntent(query);
+    if (!entry || entry.module !== disclosureModule) return result;
+    onAgentUpdate?.('Agent Router', `Understood as ${entry.module} intent ${entry.intent} (like "${entry.examples[0]}") — reading live data...`);
+    const routed = await runRoutedLiveIntent(entry, query);
+    return routed.toolResults.some(r => Array.isArray(r.data?.rows) && r.data.rows.length > 0) ? routed : result;
+  } catch (e: any) {
+    console.error('[LIVE INTENT RECOVERY ERROR]', e?.message || e);
+    return result;
+  }
+}
+
+async function processSapQueryCore(
   query: string, 
   userRole: UserRole, 
   history: Message[] = [],
@@ -19769,6 +19890,21 @@ If the image is unclear or unreadable, say so plainly and ask for a clearer imag
         retriedImageText = retryResponse.text || null;
       } catch (retryErr) {
         console.error('[IMAGE ANALYSIS RETRY ERROR]', retryErr);
+      }
+    }
+
+    const usedSimulatedTool = toolResults.some(r => isSimulatedTool(r.toolName));
+    const noLiveAnswer = !response.text && !retriedImageText && !liveDataSummary;
+    if (backendTarget !== 'ECC' && !(images && images.length > 0) && (noLiveAnswer || usedSimulatedTool)) {
+      const recovered = await recoverWithLiveIntelligence(query, onAgentUpdate);
+      if (recovered) return recovered;
+      if (usedSimulatedTool) {
+        return {
+          text: liveToolError
+            ? `Live SAP request could not be completed: ${liveToolError}`
+            : 'I could not find live data in the connected SAP system that answers this question, so no simulated figures are shown. Try naming the business object, document number or SAP transaction you are interested in.',
+          toolResults: toolResults.filter(r => !isSimulatedTool(r.toolName))
+        };
       }
     }
 
