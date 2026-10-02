@@ -1,0 +1,45 @@
+# Enterprise Knowledge Connector Configuration
+knowledge_sources:
+  aws_s3:
+    enabled: true
+    bucket_name: "company-sap-knowledge"
+    region: "us-east-1"
+    auth_type: "iam_role"
+    scan_interval: "24h"
+
+  gcp_storage:
+    enabled: true
+    bucket_name: "sap-design-docs"
+    service_account_file: "./secrets/gcp-service-account.json"
+    project_id: "enterprise-sap-project"
+
+  azure_blob:
+    enabled: true
+    container_name: "knowledge-base"
+    auth_type: "managed_identity"
+    account_name: "sapenterprise"
+
+  google_drive:
+    enabled: true
+    folder_ids:
+      - "1_xYZ_GOOGLE_DRIVE_FOLDER_ID"
+    auth_type: "oauth"
+    sync_docs: true
+    sync_sheets: true
+
+  local_path:
+    enabled: true
+    paths:
+      - "/mnt/sap-functional-specs"
+      - "/shared/abap-technical-repository"
+
+vector_database:
+  provider: "qdrant"
+  collection_name: "enterprise_sap_knowledge"
+  embedding_model: "text-embedding-004"
+
+security:
+  enable_rbac: true
+  enable_audit_log: true
+  mask_sensitive_data: true
+  encryption_at_rest: true

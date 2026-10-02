@@ -1,0 +1,61 @@
+
+# SAP System Connection & Credential Configuration
+# Centrally managed for ADI Agentic AI Plugin
+
+systems:
+  - id: S4_PROD
+    description: "SAP S/4HANA Production Environment"
+    type: "S4HANA"
+    base_url: "https://my-tenant.s4hana.ondemand.com/sap/opu/odata/sap"
+    auth:
+      method: "OAuth2"
+      client_id: "${SAP_S4_CLIENT_ID}"
+      client_secret: "${SAP_S4_CLIENT_SECRET}"
+      token_endpoint: "https://my-tenant.authentication.sap.hana.ondemand.com/oauth/token"
+    timeout: 30
+    safe_mode: true
+
+  - id: ECC_DEV
+    description: "SAP ECC Development (ERP 6.0)"
+    type: "ECC"
+    base_url: "https://ecc-gateway.internal.corp:44300/sap/bc/srt/rfc/sap"
+    auth:
+      method: "Basic"
+      username: "${SAP_ECC_USER}"
+      password: "${SAP_ECC_PWD}"
+    middleware:
+      provider: "SAP_CLOUD_CONNECTOR"
+      location_id: "US_EAST_01"
+    rfc_destination: "ECC_CLNT100"
+
+  - id: S4_SANDBOX
+    description: "SAP API Business Hub Sandbox"
+    type: "S4HANA"
+    base_url: "https://sandbox.api.sap.com/s4hanacloud/sap/opu/odata/sap"
+    auth:
+      method: "APIKey"
+      api_key: "yv5AWAk3v0G4Y1A8G8yA0G8yA0G8yA0G"
+    timeout: 10
+    safe_mode: false
+
+  - id: S8H
+    description: "S8H - S/4 2025 FAA FPS00"
+    type: "S4HANA"
+    base_url: "https://mmc-s4sap11.mmc.1stbasis.com:44300/sap/opu/odata/sap"
+    client: "100"
+    auth:
+      method: "Basic"
+      username: "${SAP_S8H_USER}"
+      password: "${SAP_S8H_PWD}"
+    router: "/H/161.38.17.212"
+    server_ip: "172.21.72.3"
+    sys_num: "00"
+    safe_mode: false
+    crud_access: "FULL"
+    write_enabled: true
+    webgui: "https://mmc-s4sap11.mmc.1stbasis.com:44300/sap/bc/gui/sap/its/webgui"
+    fiori: "https://mmc-s4sap11.mmc.1stbasis.com:44300/sap/bc/ui2/flp?sap-client=100&sap-language=EN"
+
+default_system: "S8H"
+log_level: "INFO"
+max_retries: 3

@@ -1,0 +1,8 @@
+{
+  "name": "SAP AGENTIC APP ADIs AI.20",
+  "description": "An enterprise-grade intelligent assistant for SAP operations, featuring live S/4HANA & ECC data retrieval, SAP ECC to S/4HANA Autonomous Upgrade & Migration Agent Factory (14-Stage DAG, 36 Specialist Agents, SUM/DMO, Clean-Core, Cloud IaC, Rehearsals, CVI, ACDOCA Reconciliation), 50 Natural-Language Question Agents across EHS, PM, QM, BW/4HANA & Datasphere, ABAP, HR/HCM, Basis, PP, MM, TM, and Security, dynamic SAP metadata catalog, and autonomous IDoc reprocessing.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

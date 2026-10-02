@@ -1,0 +1,15 @@
+# Google Drive Connector Settings
+google_drive_config:
+  client_id: "${GDRIVE_CLIENT_ID}"
+  client_secret: "${GDRIVE_CLIENT_SECRET}"
+  redirect_uri: "https://auth.company.com/callback"
+  scopes:
+    - "https://www.googleapis.com/auth/drive.readonly"
+  shared_drives:
+    - id: "SAP_PROJECT_OMEGA_DRIVE"
+      name: "Project Omega Shared Drive"
+  file_types:
+    - ".pdf"
+    - ".docx"
+    - ".xlsx"
+    - ".txt"
