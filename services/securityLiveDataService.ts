@@ -35,7 +35,7 @@ export function classifySecurityLiveIntent(n: string): SecurityIntent | null {
   if (sod && has('high risk', 'critical')) return 'SOD_HIGH';
   if (sod && has('conflict', 'violation')) return 'SOD_ALL';
   if ((has('create') && has('pay') && has('vendor')) || (has('create') && has('purchase order') && has('approve')) || (has('create') && has('post') && has('journal entr')) || (has('procurement') && has('payment') && has('conflict'))) return 'SOD_RULE';
-  if (has('all active users', 'list active users', 'active users in', 'list of active users') && !has('number of', 'how many')) return 'ACTIVE_USERS';
+  if ((has('all active users', 'list active users', 'active users in', 'list of active users') || (/\bactive (?:sap )?users?\b/.test(n) && has('show', 'list', 'display', 'give', 'get', 'which', 'who are'))) && !has('number of', 'how many')) return 'ACTIVE_USERS';
   if (has('not logged in', 'not logged on', 'have not logged')) return 'DORMANT_USERS';
   if (has('users created')) return 'USERS_CREATED';
   if (has('expired password')) return 'PWD_EXPIRED';

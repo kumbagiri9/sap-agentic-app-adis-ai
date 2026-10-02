@@ -9859,6 +9859,78 @@ function extractRequestedObjectLimit(query: string): number | null {
   return v > 0 ? v : null;
 }
 
+// Functional module named in an ABAP question -> SAP application component prefix (DF14L-PS_POSID).
+const ABAP_MODULE_COMPONENTS: { re: RegExp; module: string; prefix: string }[] = [
+  { re: /\bsales and distribution\b|\bsales & distribution\b|\bsd\b|\bsales\b/, module: 'Sales and Distribution (SD)', prefix: 'SD' },
+  { re: /\bmaterials? management\b|\bmm\b|\bprocurement\b|\bpurchasing\b/, module: 'Materials Management (MM)', prefix: 'MM' },
+  { re: /\bfinancial accounting\b|\bfinance\b|\bfico\b|\bfi\b/, module: 'Financial Accounting (FI)', prefix: 'FI' },
+  { re: /\bcontrolling\b|\bco\b/, module: 'Controlling (CO)', prefix: 'CO' },
+  { re: /\bproduction planning\b|\bpp\b/, module: 'Production Planning (PP)', prefix: 'PP' },
+  { re: /\bquality management\b|\bqm\b/, module: 'Quality Management (QM)', prefix: 'QM' },
+  { re: /\bplant maintenance\b|\bpm\b/, module: 'Plant Maintenance (PM)', prefix: 'PM' },
+];
+
+// Custom Z/Y programs related to a functional module, from live data: programs whose package belongs to the
+// module's application component, or that use (D010TAB) tables owned by that component.
+async function buildAbapModuleProgramReport(query: string, mod: { module: string; prefix: string }, namePattern: string): Promise<{ text: string; toolResults: ToolResult[] }> {
+  const like = namePattern === 'Z*' ? "( p~OBJ_NAME LIKE 'Z%' OR p~OBJ_NAME LIKE 'Y%' )" : `p~OBJ_NAME LIKE '${namePattern.replace(/\*$/, '%').replace(/'/g, '')}'`;
+  const [usage, owned] = await Promise.all([
+    executeReadOnlySelect(`SELECT DISTINCT x~MASTER, x~TABNAME FROM D010TAB AS x INNER JOIN TADIR AS p ON p~OBJ_NAME = x~MASTER INNER JOIN TADIR AS t ON t~OBJ_NAME = x~TABNAME INNER JOIN DD02L AS g ON g~TABNAME = x~TABNAME INNER JOIN TDEVC AS d ON d~DEVCLASS = t~DEVCLASS INNER JOIN DF14L AS f ON f~FCTR_ID = d~COMPONENT WHERE p~PGMID = 'R3TR' AND p~OBJECT = 'PROG' AND ${like} AND t~PGMID = 'R3TR' AND t~OBJECT = 'TABL' AND g~AS4LOCAL = 'A' AND g~TABCLASS = 'TRANSP' AND f~PS_POSID LIKE '${mod.prefix}%'`, 5000),
+    executeReadOnlySelect(`SELECT p~OBJ_NAME, f~PS_POSID FROM TADIR AS p INNER JOIN TDEVC AS d ON d~DEVCLASS = p~DEVCLASS INNER JOIN DF14L AS f ON f~FCTR_ID = d~COMPONENT WHERE p~PGMID = 'R3TR' AND p~OBJECT = 'PROG' AND ${like} AND f~PS_POSID LIKE '${mod.prefix}%'`, 2000)
+  ]);
+  const errors = [usage, owned].filter(r => 'error' in r).map(r => (r as { error: string }).error);
+  const tablesByProg = new Map<string, Set<string>>();
+  if (!('error' in usage)) usage.rows.forEach(r => { const k = String(r.MASTER).trim(); if (!tablesByProg.has(k)) tablesByProg.set(k, new Set()); tablesByProg.get(k)!.add(String(r.TABNAME).trim()); });
+  const componentByProg = new Map<string, string>();
+  if (!('error' in owned)) owned.rows.forEach(r => componentByProg.set(String(r.OBJ_NAME).trim(), String(r.PS_POSID).trim()));
+  const names = [...new Set([...tablesByProg.keys(), ...componentByProg.keys()])].sort();
+
+  const details = new Map<string, { pkg: string; author: string; created: string; text: string }>();
+  for (let i = 0; i < names.length; i += 40) {
+    const inList = names.slice(i, i + 40).map(nm => `'${nm.replace(/'/g, '')}'`).join(', ');
+    const [hdr, txt] = await Promise.all([
+      executeReadOnlySelect(`SELECT OBJ_NAME, DEVCLASS, AUTHOR, CREATED_ON FROM TADIR WHERE PGMID = 'R3TR' AND OBJECT = 'PROG' AND OBJ_NAME IN (${inList})`, 100),
+      executeReadOnlySelect(`SELECT NAME, TEXT FROM TRDIRT WHERE SPRSL = 'E' AND NAME IN (${inList})`, 100)
+    ]);
+    if (!('error' in hdr)) hdr.rows.forEach(r => details.set(String(r.OBJ_NAME).trim(), { pkg: String(r.DEVCLASS || '').trim(), author: String(r.AUTHOR || '').trim(), created: String(r.CREATED_ON || '').trim(), text: '' }));
+    if (!('error' in txt)) txt.rows.forEach(r => { const d = details.get(String(r.NAME).trim()); if (d) d.text = String(r.TEXT || '').trim(); });
+  }
+
+  const fmtDate = (d: string) => /^\d{8}$/.test(d) ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}` : (d || '\u2014');
+  const allRows = names.map(nm => {
+    const d = details.get(nm);
+    const tabs = [...(tablesByProg.get(nm) || [])].sort();
+    return {
+      name: nm,
+      description: d?.text || '\u2014',
+      package: d?.pkg || '\u2014',
+      author: d?.author || '\u2014',
+      created: fmtDate(d?.created || ''),
+      relation: componentByProg.has(nm) ? `Package in component ${componentByProg.get(nm)}` : `Uses ${mod.prefix} table(s)`,
+      tables: tabs.length ? `${tabs.slice(0, 8).join(', ')}${tabs.length > 8 ? ` (+${tabs.length - 8})` : ''}` : '\u2014'
+    };
+  });
+  const requestedLimit = extractRequestedObjectLimit(query);
+  const rows = requestedLimit ? allRows.slice(0, requestedLimit) : allRows;
+  const errNote = errors.length ? ` Some live lookups failed: ${errors.join(' | ')}` : '';
+  const text = names.length
+    ? `${names.length} custom ABAP program(s) (${namePattern}) in this S/4HANA system are related to ${mod.module}${requestedLimit ? `; showing ${rows.length} as you asked` : ''}. Relation is read live: the program's package belongs to the ${mod.prefix} application component, or the program uses tables owned by ${mod.prefix} (e.g. ${[...new Set(allRows.flatMap(r => r.tables.split(', ')))].filter(t => t !== '\u2014').slice(0, 5).join(', ')}).`
+    : errors.length
+      ? `The live lookup of custom programs related to ${mod.module} could not be completed: ${errors.join(' | ')}`
+      : `No custom ABAP program (${namePattern}) in this S/4HANA system belongs to the ${mod.prefix} application component or uses a table owned by it.`;
+  const result = buildMmReportResult('queryAdtRaw', text,
+    `Custom ABAP Programs Related to ${mod.module}`,
+    [{ label: 'Programs', value: String(names.length) }, ...(requestedLimit ? [{ label: 'Shown (as requested)', value: String(rows.length) }] : []), { label: 'Via package component', value: String(componentByProg.size) }, { label: `Via ${mod.prefix} table usage`, value: String([...tablesByProg.keys()].filter(k => !componentByProg.has(k)).length) }],
+    [{ key: 'name', label: 'Program' }, { key: 'description', label: 'Description' }, { key: 'package', label: 'Package' }, { key: 'author', label: 'Created By' }, { key: 'created', label: 'Created On' }, { key: 'relation', label: `Relation to ${mod.prefix}` }, { key: 'tables', label: `${mod.prefix} Tables Used` }],
+    rows,
+    `Live repository data: TADIR (custom R3TR PROG objects), TRDIRT (titles), TDEVC/DF14L (package application component ${mod.prefix}*) and D010TAB (tables used by each program, where-used index) joined with DD02L (transparent tables only) and the owning application component of each table.${errNote}`
+  );
+  const data = result.toolResults[0].data as any;
+  data.pageSize = 25;
+  data.downloadable = true;
+  return result;
+}
+
 // Live ABAP Object Discovery report — the core dispatcher for the ABAP Agent. Given a natural-
 // language request, resolves a real name pattern + real ADT object type(s), runs the live
 // repository search, and returns exactly what the connected system + this account's real
@@ -9867,6 +9939,8 @@ async function buildAbapObjectDiscoveryReport(query: string): Promise<{ text: st
   const q = normalizeSdPrompt(query);
   const namePattern = extractAbapNamePattern(query);
   const typeIntent = classifyAbapObjectTypeIntent(q);
+  const moduleScope = typeIntent?.types.includes('PROG/P') ? ABAP_MODULE_COMPONENTS.find(m => m.re.test(q)) : undefined;
+  if (moduleScope) return buildAbapModuleProgramReport(query, moduleScope, namePattern);
 
   let refs: AdtObjectRef[] = [];
   let searchedTypesLabel: string;
@@ -13843,6 +13917,8 @@ async function processSapQueryCore(
       // Word-boundary tests for imperative verbs only — "created"/"changed" (past tense,
       // descriptive read-only questions) must never match "create"/"change" (action commands).
       const has = (word: string) => new RegExp(`\\b${word}\\b`, 'i').test(n);
+      // Procedural knowledge questions ("steps how to create a sales order in ECC") are answered by the SAP knowledge path, not executed.
+      if (/\bhow (?:to|do|can|should|would)\b|\bsteps?\b|step-by-step|\bprocedure\b|\bguide\b|\binstructions?\b|walk me through|\btutorial\b|\bexplain\b|what is the process/.test(n)) return null;
       // Non-SD document domains (freight/transportation/purchase/warehouse orders) must never be
       // captured by the generic "create/change/cancel ... order" SD patterns below — they have
       // their own module-specific honest-disclosure/live handling further down the pipeline.
@@ -19893,8 +19969,49 @@ If the image is unclear or unreadable, say so plainly and ask for a clearer imag
       }
     }
 
+    // Procedural "how to / steps" questions: when the model only returned a screen card, answer from SAP process knowledge.
+    let knowledgeText: string | null = null;
+    const isProceduralQuestion = /\bhow (?:to|do|can|should|would)\b|\bsteps?\b|step-by-step|\bprocedure\b|\binstructions?\b|walk me through|\btutorial\b/i.test(query);
+    if (isProceduralQuestion && !response.text && !retriedImageText && !liveDataSummary && !liveToolError && !(images && images.length > 0)) {
+      onAgentUpdate?.('SAP Knowledge Hub', 'Composing step-by-step SAP procedure from SAP process knowledge...');
+      try {
+        const knowledgeResponse = await generateContentWithFallback({
+          model: 'gemini-3.1-flash-lite',
+          contents: [{ role: 'user', parts: [{ text: query }] }],
+          config: {
+            systemInstruction: `You are the SAP Knowledge Hub expert for ${userRole}. The user asks HOW TO PERFORM A TASK in SAP. Answer with precise, practical step-by-step instructions only: the transaction code (and Fiori app if relevant), the exact navigation path, required fields per screen, how to save, and how to validate the result. Respect the system the user names (ECC vs S/4HANA) and flag ECC vs S/4HANA differences where relevant. Use bold headings and numbered steps. Do not invent document numbers, customer numbers or other data values; use field names only. Do not mention servers, IPs or APIs.`,
+            maxOutputTokens: 4096
+          }
+        });
+        knowledgeText = knowledgeResponse.text?.trim() || null;
+      } catch (knowledgeErr) {
+        console.error('[SAP KNOWLEDGE HUB ERROR]', knowledgeErr);
+      }
+    }
+
+    // SAP knowledge questions (T-codes, tables, BAPIs, config, concepts) where the model only returned tool output: answer from that output.
+    const isSapKnowledgeQuestion = /\b(?:t-?codes?|transaction codes?|tables?|bapis?|function modules?|user exits?|badis?|enhancements?|spro|customi[sz]ing|configuration|fiori apps?|authori[sz]ation objects?|idoc types?|message types?|what is|what are|explain|difference between|documentation|best practices?)\b/i.test(query) && !/\b\d{5,}\b/.test(query);
+    const knowledgeEvidence = toolResults.filter(r => r.type !== 'error' && r.data);
+    if (!knowledgeText && isSapKnowledgeQuestion && knowledgeEvidence.length > 0 && !response.text && !retriedImageText && !(images && images.length > 0)) {
+      onAgentUpdate?.('SAP Knowledge Hub', 'Composing the answer from the retrieved SAP catalog/metadata...');
+      try {
+        const evidence = JSON.stringify(knowledgeEvidence.map(r => ({ tool: r.toolName, data: r.data }))).slice(0, 30000);
+        const knowledgeResponse = await generateContentWithFallback({
+          model: 'gemini-3.1-flash-lite',
+          contents: [{ role: 'user', parts: [{ text: `Question: "${query}"\n\nRetrieved SAP data (JSON):\n${evidence}` }] }],
+          config: {
+            systemInstruction: `You are the SAP Knowledge Hub agent for ${userRole}. Answer the user's SAP knowledge question using the retrieved SAP data as the primary source: list every relevant item it contains (e.g. each T-code with its description, category and authorization object) in a markdown table, then add short practical notes. You may add SAP standard product knowledge (what a T-code, table or process is for), but never invent business data values (document numbers, quantities, amounts, users). Respect the system the user names (ECC vs S/4HANA). Use bold headings. Do not mention servers, hosts, IPs, user IDs or APIs.`,
+            maxOutputTokens: 4096
+          }
+        });
+        knowledgeText = knowledgeResponse.text?.trim() || null;
+      } catch (knowledgeErr) {
+        console.error('[SAP KNOWLEDGE HUB ERROR]', knowledgeErr);
+      }
+    }
+
     const usedSimulatedTool = toolResults.some(r => isSimulatedTool(r.toolName));
-    const noLiveAnswer = !response.text && !retriedImageText && !liveDataSummary;
+    const noLiveAnswer = !response.text && !retriedImageText && !liveDataSummary && !knowledgeText;
     if (backendTarget !== 'ECC' && !(images && images.length > 0) && (noLiveAnswer || usedSimulatedTool)) {
       const recovered = await recoverWithLiveIntelligence(query, onAgentUpdate);
       if (recovered) return recovered;
@@ -19909,7 +20026,7 @@ If the image is unclear or unreadable, say so plainly and ask for a clearer imag
     }
 
     return {
-      text: response.text || retriedImageText || liveDataSummary || (liveToolError
+      text: response.text || retriedImageText || knowledgeText || liveDataSummary || (liveToolError
         ? `Live SAP request could not be completed: ${liveToolError}`
         : (images && images.length > 0
           ? 'The vision model returned an empty analysis for this image on two attempts, with no error reported. This can happen with very large, low-resolution, or unusual image formats. Please try re-uploading a clearer screenshot (PNG/JPG) or resend your question.'
