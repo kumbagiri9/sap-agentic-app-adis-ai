@@ -20,6 +20,7 @@ export type SdActionType =
   | 'RELEASE_BILLING_BLOCK'
   | 'REPROCESS_FAILED_IDOCS'
   | 'CHANGE_DELIVERY_PRIORITY'
+  | 'CHANGE_DELIVERY_QUANTITY'
   | 'TRIGGER_CUSTOMER_NOTIFICATION';
 
 type Classification = 'AUTO' | 'SENSITIVE' | 'NOT_AVAILABLE';
@@ -38,7 +39,8 @@ export const SD_ACTION_CATALOG: Record<SdActionType, { title: string; classifica
   RELEASE_BILLING_BLOCK: { title: 'Release Billing Block', classification: 'SENSITIVE' },
   REPROCESS_FAILED_IDOCS: { title: 'Reprocess Failed IDocs', classification: 'AUTO' },
   CHANGE_DELIVERY_PRIORITY: { title: 'Change Delivery Priority', classification: 'NOT_AVAILABLE', unavailableReason: 'Live S/4HANA API_OUTBOUND_DELIVERY_SRV/A_OutbDeliveryHeader.DeliveryPriority is marked non-modifiable (sap:creatable="false") in this landscape\'s exposed metadata; a live PATCH attempt was confirmed rejected with HTTP 400.' },
-  TRIGGER_CUSTOMER_NOTIFICATION: { title: 'Trigger Customer Notification', classification: 'AUTO' }
+  TRIGGER_CUSTOMER_NOTIFICATION: { title: 'Trigger Customer Notification', classification: 'AUTO' },
+  CHANGE_DELIVERY_QUANTITY: { title: 'Change Delivery Item Quantity', classification: 'SENSITIVE' }
 };
 
 export interface SdActionProposal {
@@ -209,6 +211,41 @@ async function proposeChangeDeliveryPriority(deliveryId: string, newPriority: st
   };
 }
 
+// Changes the delivery quantity of one outbound delivery item (A_OutbDeliveryItem.ActualDeliveryQuantity, updatable per
+// live $metadata). The item is the one named, else the one whose current quantity equals the stated "from" quantity, else the only item.
+async function proposeChangeDeliveryQuantity(deliveryId: string, newQuantity: number, fromQuantity?: number, itemNo?: string): Promise<SdActionProposal & { execute: () => Promise<any> }> {
+  const delivery = await readDelivery(deliveryId);
+  if (!delivery) throw new Error(`Outbound Delivery ${deliveryId} not found live.`);
+  if (String(delivery.OverallGoodsMovementStatus || '') === 'C') throw new Error(`Outbound Delivery ${deliveryId} already has goods issue posted (goods movement status C), so its quantities can no longer be changed. Reverse the goods issue first.`);
+  const items = await sapApi.queryS8HOData('API_OUTBOUND_DELIVERY_SRV', 'A_OutbDeliveryItem', `$filter=DeliveryDocument eq '${deliveryId}'&$select=DeliveryDocument,DeliveryDocumentItem,Material,ActualDeliveryQuantity,DeliveryQuantityUnit,PickingStatus,GoodsMovementStatus&$top=200`);
+  if (items?.error || !Array.isArray(items) || items.length === 0) throw new Error(`No items found live for Outbound Delivery ${deliveryId}.`);
+  const norm = (s: string) => String(s || '').replace(/^0+/, '');
+  let target: any = itemNo ? items.find((i: any) => norm(i.DeliveryDocumentItem) === norm(itemNo)) : undefined;
+  if (!target && !itemNo && fromQuantity !== undefined) {
+    const matches = items.filter((i: any) => Number(i.ActualDeliveryQuantity) === fromQuantity);
+    if (matches.length === 1) target = matches[0];
+  }
+  if (!target && !itemNo && items.length === 1) target = items[0];
+  if (!target) throw new Error(`Please name the item to change (e.g. "item 10"). Delivery ${deliveryId} items: ${items.map((i: any) => `${norm(i.DeliveryDocumentItem)} (${i.Material}, ${Number(i.ActualDeliveryQuantity)} ${i.DeliveryQuantityUnit})`).join('; ')}.`);
+  const current = Number(target.ActualDeliveryQuantity);
+  if (fromQuantity !== undefined && current !== fromQuantity) throw new Error(`Item ${norm(target.DeliveryDocumentItem)} of delivery ${deliveryId} currently has ${current} ${target.DeliveryQuantityUnit}, not ${fromQuantity}. Nothing was changed.`);
+  if (current === newQuantity) throw new Error(`Item ${norm(target.DeliveryDocumentItem)} of delivery ${deliveryId} already has ${newQuantity} ${target.DeliveryQuantityUnit}. Nothing to change.`);
+  return {
+    proposalId: genId('PROP-SD'),
+    actionType: 'CHANGE_DELIVERY_QUANTITY',
+    title: SD_ACTION_CATALOG.CHANGE_DELIVERY_QUANTITY.title,
+    targetId: `${deliveryId} / item ${norm(target.DeliveryDocumentItem)}`,
+    currentState: {
+      Material: target.Material, ActualDeliveryQuantity: `${current} ${target.DeliveryQuantityUnit}`,
+      PickingStatus: target.PickingStatus || '(none)', GoodsMovementStatus: target.GoodsMovementStatus || '(none)',
+      ...(String(target.PickingStatus) === 'C' && newQuantity < current ? { Note: 'Item is fully picked; SAP rejects a delivery quantity below the picked quantity unless picking is adjusted first.' } : {})
+    },
+    proposedChange: { ActualDeliveryQuantity: `${newQuantity} ${target.DeliveryQuantityUnit}` },
+    createdAt: Date.now(),
+    execute: () => sapApi.writeS8HOData('API_OUTBOUND_DELIVERY_SRV', 'A_OutbDeliveryItem', 'PATCH', `DeliveryDocument='${deliveryId}',DeliveryDocumentItem='${target.DeliveryDocumentItem}'`, { ActualDeliveryQuantity: String(newQuantity) })
+  };
+}
+
 async function proposeChangeSalesOrder(orderId: string, field: string, newValue: string): Promise<SdActionProposal & { execute: () => Promise<any> }> {
   const ALLOWED_FIELDS = ['PurchaseOrderByCustomer', 'CustomerPurchaseOrderDate'];
   if (!ALLOWED_FIELDS.includes(field)) throw new Error(`Field "${field}" is not in the allowed safe-change list (${ALLOWED_FIELDS.join(', ')}).`);
@@ -322,6 +359,7 @@ export async function proposeSensitiveSdAction(actionType: SdActionType, params:
     case 'RELEASE_BILLING_BLOCK': proposal = await proposeReleaseBillingBlock(params.orderId); break;
     case 'CANCEL_ORDER': proposal = await proposeCancelOrder(params.orderId); break;
     case 'CHANGE_DELIVERY_PRIORITY': proposal = await proposeChangeDeliveryPriority(params.deliveryId, params.newPriority || '02'); break;
+    case 'CHANGE_DELIVERY_QUANTITY': proposal = await proposeChangeDeliveryQuantity(params.deliveryId, params.newQuantity, params.fromQuantity, params.itemNo); break;
     case 'CHANGE_SALES_ORDER': proposal = await proposeChangeSalesOrder(params.orderId, params.field, params.newValue); break;
     case 'CREATE_SALES_ORDER': proposal = await proposeCreateSalesOrder(params.soldToParty, params.material, params.quantity, params.requestedDeliveryDateIso, params.verificationChain); break;
     case 'CREATE_RETURN_ORDER': proposal = await proposeCreateReturnOrder(params.soldToParty, params.material, params.quantity, params.referenceOrder); break;

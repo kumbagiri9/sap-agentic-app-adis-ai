@@ -229,6 +229,7 @@ import { SapEmbeddedWorkspace, SapTab } from './components/SapEmbeddedWorkspace'
 import { idocService } from './services/idocService';
 import { LiveSapUnavailableCard } from './components/LiveSapUnavailableCard';
 import { AnswerTrustPanel } from './components/AnswerTrustPanel';
+import { LiveKpiDashboardCard } from './components/LiveKpiDashboardCard';
 import { sapOperatingModeManager } from './services/sapService';
 
 const isLiveSapUnavailableMessage = (content?: string) =>
@@ -1581,6 +1582,7 @@ const App: React.FC = () => {
       );
     }
     if (result.type === 'documentation') return null;
+    if (result.type === 'sap_knowledge_hub') return null;
 
     return (
       <div className="space-y-3 mb-6 w-full animate-in slide-in-from-bottom-2">
@@ -1626,6 +1628,8 @@ const App: React.FC = () => {
             {result.type === 'sd_executive_intelligence_report' && <SdExecutiveIntelligenceReportCard data={result.data} />}
             {result.type === 'sd_action_result' && <SdActionResultCard data={result.data} />}
             {result.type === 'sd_action_approval_request' && <SdActionApprovalCard data={result.data} />}
+            {result.type === 'live_update_approval_request' && <SdActionApprovalCard data={result.data} endpoint="/api/live-update/decide" />}
+            {result.type === 'live_kpi_dashboard' && <LiveKpiDashboardCard data={result.data} />}
             {result.type === 'fico_action_result' && <SdActionResultCard data={result.data} />}
             {result.type === 'fico_action_approval_request' && <SdActionApprovalCard data={result.data} endpoint="/api/fico-action/decide" />}
             {result.type === 'ewm_action_result' && <SdActionResultCard data={result.data} />}
@@ -2946,7 +2950,9 @@ const App: React.FC = () => {
                                   />
                                 );
                               }
-                              const theme = getMessageTheme(msg.content);
+                              const theme = (msg.toolResults || []).some((r: any) => r?.type === 'sap_knowledge_hub')
+                                ? { border: 'border-l-4 border-l-violet-500 border-violet-200', bg: 'bg-violet-50/10', icon: 'fa-solid fa-book-open text-violet-600', title: 'SAP KNOWLEDGE HUB AGENT', accentText: 'text-violet-700', pillBg: 'bg-violet-50 border-violet-200 text-violet-700', pillLabel: 'SAP Standard Know-How' }
+                                : getMessageTheme(msg.content);
 
                               return (
                                 <div className={`p-5 md:p-8 bg-white border ${theme.border} text-slate-800 rounded-2xl rounded-tl-none shadow-md hover:shadow-lg transition-all duration-300 relative overflow-hidden flex flex-col space-y-5`}>

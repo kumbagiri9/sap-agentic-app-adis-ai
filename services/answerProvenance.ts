@@ -17,9 +17,9 @@ export interface AnswerProvenance {
 
 type Result = { text: string; toolResults: any[] };
 
-const KNOWLEDGE_TYPES = new Set(['gui_card', 'ecc_transactions', 'kb_search', 'download_doc', 'ecc_tcode_launcher']);
+const KNOWLEDGE_TYPES = new Set(['gui_card', 'ecc_transactions', 'kb_search', 'download_doc', 'ecc_tcode_launcher', 'sap_knowledge_hub']);
 const UNAVAILABLE_TYPES = new Set(['fico_service_unavailable', 'hana_db_unavailable']);
-const SQL_TOOLS = new Set(['basisLiveData', 'securityLiveData', 'bwLiveData', 'tmLiveData', 'abapLiveData', 'hanaDbIntelligence']);
+const SQL_TOOLS = new Set(['basisLiveData', 'securityLiveData', 'bwLiveData', 'tmLiveData', 'abapLiveData', 'hanaDbIntelligence', 'scenarioLiveData', 'apLiveData']);
 const MODULE_BY_TOOL: Record<string, LiveModule> = { basisLiveData: 'BASIS', securityLiveData: 'SECURITY', bwLiveData: 'BW', tmLiveData: 'TM', abapLiveData: 'ABAP', queryAdtRaw: 'ABAP' };
 
 function isEcc(r: any): boolean {
@@ -32,6 +32,7 @@ function channelOf(r: any): string | undefined {
   if (SQL_TOOLS.has(name)) return 'Read-only database query';
   if (name === 'queryAdtRaw') return 'SAP development repository (ADT)';
   if (/odata|^query(live)?s8h|^query(ewm|tm|bw)v|gateway|userservice/i.test(name)) return 'SAP OData API';
+  if (/\bAPI_[A-Z0-9_]+|[A-Z0-9_]+_SRV\b/.test(`${r?.data?.reportTitle || ''} ${r?.data?.note || ''}`)) return 'SAP OData API';
   return undefined;
 }
 
@@ -89,6 +90,13 @@ export function buildAnswerProvenance(query: string, result: Result, durationMs:
   }
 
   const errorResult = results.find(r => r?.type === 'error');
+  const notPossible = results.find(r => r?.type === 'live_update_not_possible');
+  if (notPossible) {
+    return { ...base, kind: 'not_available', headline: 'The change could not be prepared, so nothing was written to SAP.', system, sources: [], whatYouCanDo: String(notPossible.data?.reason || '') };
+  }
+  if (!errorResult && results.some(r => /_approval_request$/.test(String(r?.type || '')))) {
+    return { ...base, kind: 'system', headline: `A change to ${ecc ? 'your SAP ECC system' : 'your S/4HANA system'} has been prepared from the live record. Nothing is written until you approve it.`, system, channel: 'SAP OData API', sources, whatYouCanDo: 'Check the current and proposed values, then choose Approve or Reject.' };
+  }
   const liveResults = results.filter(r => r?.type !== 'error' && !UNAVAILABLE_TYPES.has(r?.type) && !KNOWLEDGE_TYPES.has(r?.type) && r?.data);
   if ((errorResult && !liveResults.length) || /^\[LIVE_SAP_UNAVAILABLE\]|^live sap request could not be completed/i.test(text)) {
     const reasonText = `${text} ${errorResult?.data?.error || ''}`;

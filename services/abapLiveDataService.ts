@@ -1199,6 +1199,355 @@ export function abapSpecSections(f: AbapSpecFacts, verified: Record<string, stri
   ];
 }
 
+// ---------- Fit-to-Standard & S/4HANA modernization recommendations (added to the specification) ----------
+const isCustomName = (n: string) => /^[ZY]/i.test(n);
+
+export type ApiReleaseInfo = { name: string; type: string; releaseState: string; successor: string };
+export type ModernizationEvidence = {
+  program: string; title: string; kind: string; pkg: string;
+  sapTables: { table: string; access: string; releaseState: string; successor: string; simplification: string }[];
+  apis: ApiReleaseInfo[];
+  customDependencies: { type: string; name: string }[];
+  codeFindings: { finding: string; count: number; detail: string }[];
+  usage: { tcodes: string; variants: number; jobSteps: number; dumps30d: number; created: string; lastChanged: string; transports: number; lastTransport: string; usageMonitoring: string };
+  duplicates: { name: string; title: string }[];
+  standardCandidates: Record<string, string>[];
+};
+
+// Release state (ABAP Cloud contract C1 preferred) and successor of SAP objects, read live from ARS_W_API_STATE.
+export async function apiReleaseStates(objs: { name: string; type: string }[]): Promise<Map<string, ApiReleaseInfo>> {
+  const out = new Map<string, ApiReleaseInfo>();
+  const names = [...new Set(objs.map(o => o.name.toUpperCase()))].filter(Boolean);
+  for (let i = 0; i < names.length; i += 40) {
+    const r = await q(`SELECT OBJECT_TYPE, OBJECT_ID, COMPATIBILITY_CONTRACT, RELEASE_STATE, SUCCESSOR_OBJECT_TYPE, SUCCESSOR_OBJECT_NAME, SUCCESSOR_CONCEPT_NAME FROM ARS_W_API_STATE WHERE OBJECT_ID IN ( ${inList(names.slice(i, i + 40))} )`, 400);
+    for (const n of names.slice(i, i + 40)) {
+      const rows = r.rows.filter(x => x.OBJECT_ID === n);
+      const pick = rows.find(x => x.COMPATIBILITY_CONTRACT === 'C1') || rows[0];
+      const type = objs.find(o => o.name.toUpperCase() === n)?.type || pick?.OBJECT_TYPE || '';
+      const succ = rows.map(x => x.SUCCESSOR_OBJECT_NAME ? `${x.SUCCESSOR_OBJECT_NAME}${x.SUCCESSOR_OBJECT_TYPE ? ` (${x.SUCCESSOR_OBJECT_TYPE})` : ''}` : x.SUCCESSOR_CONCEPT_NAME).find(Boolean) || '';
+      out.set(n, {
+        name: n, type,
+        releaseState: r.error ? 'To Be Validated (release-state lookup failed)' : pick ? `${pick.RELEASE_STATE === 'RELEASED' ? 'Released' : pick.RELEASE_STATE === 'NOT_TO_BE_RELEASED' ? 'Not to be released' : pick.RELEASE_STATE === 'DEPRECATED' ? 'Deprecated' : pick.RELEASE_STATE}${pick.COMPATIBILITY_CONTRACT ? ` (${pick.COMPATIBILITY_CONTRACT})` : ''}` : 'Not released (no release-state record)',
+        successor: succ
+      });
+    }
+  }
+  return out;
+}
+
+export async function collectModernizationEvidence(f: AbapSpecFacts, verified: Record<string, string>[]): Promise<ModernizationEvidence> {
+  const sapTableNames = f.tables.filter(t => !isCustomName(t.table)).map(t => t.table);
+  const sapFms = f.functions.filter(x => !isCustomName(x.name)).map(x => x.name);
+  const sapClasses = f.classes.filter(c => !isCustomName(c));
+  const [release, dup] = await Promise.all([
+    apiReleaseStates([...sapTableNames.map(name => ({ name, type: 'TABL' })), ...sapFms.map(name => ({ name, type: 'FUNC' })), ...sapClasses.map(name => ({ name, type: 'CLAS' }))]),
+    f.title ? q(`SELECT NAME, TEXT FROM TRDIRT WHERE SPRSL = 'E' AND TEXT = '${f.title.replace(/'/g, "''")}' AND ( NAME LIKE 'Z%' OR NAME LIKE 'Y%' )`, 50) : Promise.resolve({ rows: [], total: 0 } as Q)
+  ]);
+  const src = f.source;
+  const count = (re: RegExp) => (src.match(re) || []).length;
+  const issueCounts = new Map<string, number>();
+  f.selects.forEach(s => s.issues.forEach(i => issueCounts.set(i, (issueCounts.get(i) || 0) + 1)));
+  const sapReads = f.selects.filter(s => s.tables.some(t => !isCustomName(t))).length;
+  const sapWrites = f.writes.filter(w => !isCustomName(w.table));
+  const findings = [
+    { finding: 'Direct SELECT on SAP standard tables', count: sapReads, detail: [...new Set(f.selects.flatMap(s => s.tables).filter(t => !isCustomName(t)))].join(', ') },
+    { finding: 'Direct database update of SAP standard tables', count: sapWrites.length, detail: [...new Set(sapWrites.map(w => `${w.op} ${w.table}`))].join(', ') },
+    { finding: 'CALL TRANSACTION (screen-based processing)', count: f.transactionsCalled.length, detail: f.transactionsCalled.join(', ') },
+    { finding: 'SUBMIT of other programs', count: f.submits.length, detail: f.submits.join(', ') },
+    { finding: 'Explicit AUTHORITY-CHECK statements', count: f.authChecks.length, detail: f.authChecks.join(', ') || 'None in the source' },
+    { finding: 'FORM routines (procedural modularisation)', count: f.routines.length, detail: f.routines.slice(0, 15).join(', ') },
+    { finding: 'OCCURS / WITH HEADER LINE (obsolete internal tables)', count: count(/\bOCCURS\b|WITH HEADER LINE/gi), detail: '' },
+    { finding: 'TABLES statement (obsolete work areas)', count: count(/^\s*TABLES\b/gim), detail: '' },
+    { finding: 'Native SQL (EXEC SQL)', count: count(/\bEXEC\s+SQL\b/gi), detail: '' },
+    { finding: 'Classic list output (WRITE)', count: count(/^\s*WRITE\b/gim), detail: '' },
+    ...[...issueCounts.entries()].map(([finding, c]) => ({ finding: `SELECT finding: ${finding}`, count: c, detail: '' }))
+  ].filter(x => x.count > 0 || x.finding.startsWith('Explicit AUTHORITY'));
+  const customDependencies = [
+    ...f.tables.filter(t => isCustomName(t.table)).map(t => ({ type: 'Table', name: t.table })),
+    ...f.functions.filter(x => isCustomName(x.name)).map(x => ({ type: 'Function module', name: x.name })),
+    ...f.classes.filter(isCustomName).map(name => ({ type: 'Class', name })),
+    ...f.submits.filter(isCustomName).map(name => ({ type: 'Submitted program', name })),
+    ...f.transactionsCalled.filter(isCustomName).map(name => ({ type: 'Transaction', name }))
+  ];
+  return {
+    program: f.name, title: f.title, kind: f.kind, pkg: f.pkg,
+    sapTables: f.tables.filter(t => !isCustomName(t.table)).map(t => ({ table: t.table, access: t.access, releaseState: release.get(t.table)?.releaseState || '', successor: release.get(t.table)?.successor || '', simplification: t.simplification })),
+    apis: [...sapFms, ...sapClasses].map(n => release.get(n.toUpperCase())).filter(Boolean) as ApiReleaseInfo[],
+    customDependencies,
+    codeFindings: findings,
+    usage: {
+      tcodes: f.tcodes.join(', ') || 'None assigned', variants: f.variants, jobSteps: f.jobSteps, dumps30d: f.dumps.reduce((a, d) => a + (Number(d.count) || 0), 0),
+      created: f.created, lastChanged: f.changed, transports: f.transports.length, lastTransport: f.transports[0] ? `${f.transports[0].trkorr} (${f.transports[0].date})` : 'None',
+      usageMonitoring: 'No usage-monitoring data (SCMON/SUSG) is collected in this system \u2014 execution frequency is To Be Validated.'
+    },
+    duplicates: dup.rows.filter(x => x.NAME !== f.name).map(x => ({ name: x.NAME, title: x.TEXT })),
+    standardCandidates: verified
+  };
+}
+
+export type ModernizationRecommendation = {
+  priority: number; area: string; applicable: string; verdict: string;
+  currentCustomSolution: string; businessRequirement: string; s4StandardAlternative: string; fitGap: string; btpInAppAlternative: string;
+  recommendedTargetArchitecture: string; migrationComplexity: string; dependencies: string; businessBenefit: string; risk: string;
+  requiredActions: string[]; verifiedFindings: string[]; toBeValidated: string[];
+};
+export type ModernizationPlan = { summary?: string; recommendations?: ModernizationRecommendation[]; namedObjects?: AbapStandardCandidate[] };
+
+export const MODERNIZATION_AREAS = ['Fit-to-Standard', 'Clean Core', 'BTP Extension', 'S/4HANA In-App Extension', 'Refactor / Retain', 'Retirement'];
+
+export function renderModernizationSection(e: ModernizationEvidence, plan: ModernizationPlan | null, objectChecks: Record<string, string>[]): string {
+  const h4 = (t: string) => `<h4 style='color:#1e5f8c;margin-top:14pt'>${esc(t)}</h4>`;
+  const recs = (plan?.recommendations || []).slice().sort((a, b) => (a.priority || 9) - (b.priority || 9));
+  const recBlock = (r: ModernizationRecommendation) => `${h4(`(${r.priority}) ${r.area}`)}
+${htmlTable(['Item', 'Content'], [
+    ['Applies to this program', r.applicable || 'To Be Validated'], ['Verdict', r.verdict || '\u2014'],
+    ['Current Custom Solution', r.currentCustomSolution || '\u2014'], ['Business Requirement', r.businessRequirement || '\u2014'],
+    ['S/4 Standard Alternative', r.s4StandardAlternative || '\u2014'], ['Fit/Gap', r.fitGap || '\u2014'],
+    ['BTP/In-App Alternative', r.btpInAppAlternative || '\u2014'], ['Recommended Target Architecture', r.recommendedTargetArchitecture || '\u2014'],
+    ['Migration Complexity', r.migrationComplexity || 'To Be Validated'], ['Dependencies', r.dependencies || '\u2014'],
+    ['Business Benefit', r.businessBenefit || '\u2014'], ['Risk', r.risk || '\u2014'],
+    ['Required Actions', (r.requiredActions || []).join(' | ') || '\u2014'],
+    ['Verified findings (live system / source)', (r.verifiedFindings || []).join(' | ') || 'None'],
+    ['To Be Validated', (r.toBeValidated || []).join(' | ') || 'None']
+  ])}`;
+  return `
+<h3>Fit-to-Standard &amp; S/4HANA Modernization Recommendations</h3>
+<p class='note'>Added to this specification on the basis of the live system and the real source of ${esc(e.program)}. <strong>Verified</strong> = read live from the S/4HANA repository, data dictionary, API release registry (ARS_W_API_STATE) or the source code. <strong>Recommendation</strong> = architect advice derived from that evidence. <strong>To Be Validated</strong> = needs confirmation (for example Fiori app IDs, BTP services and execution frequency, which cannot be read from this system). Existing sections of this document are unchanged.</p>
+${plan ? '' : '<p><em>The AI recommendation narrative could not be generated; only the verified live evidence is listed below.</em></p>'}
+${plan?.summary ? `${h4('Summary')}<p>${esc(plan.summary)}</p>` : ''}
+${recs.length ? `${h4('Recommendation overview (priority order)')}${htmlTable(['Priority', 'Area', 'Applies', 'Verdict', 'Migration complexity'], recs.map(r => [r.priority, r.area, r.applicable, r.verdict, r.migrationComplexity]))}` : ''}
+${h4('Verified live evidence')}
+<p><strong>SAP standard tables accessed directly</strong></p>
+${htmlTable(['Table', 'Access by program', 'API release state', 'Successor', 'S/4HANA simplification'], e.sapTables.map(t => [t.table, t.access, t.releaseState, t.successor || '\u2014', t.simplification || '\u2014']))}
+<p><strong>SAP function modules / classes used</strong></p>
+${htmlTable(['Object', 'Type', 'API release state', 'Successor'], e.apis.map(a => [a.name, a.type, a.releaseState, a.successor || '\u2014']))}
+<p><strong>Custom (Z/Y) dependencies</strong></p>
+${htmlTable(['Type', 'Object'], e.customDependencies.map(d => [d.type, d.name]))}
+<p><strong>Code findings (from the real source)</strong></p>
+${htmlTable(['Finding', 'Occurrences', 'Detail'], e.codeFindings.map(c => [c.finding, c.count, c.detail || '\u2014']))}
+<p><strong>Usage and lifecycle indicators</strong></p>
+${htmlTable(['Indicator', 'Value'], [['Transaction codes', e.usage.tcodes], ['Saved variants', e.usage.variants], ['Background job steps', e.usage.jobSteps], ['Runtime errors (30 days)', e.usage.dumps30d], ['Created', e.usage.created], ['Last changed', e.usage.lastChanged], ['Transports', `${e.usage.transports} (latest: ${e.usage.lastTransport})`], ['Execution frequency', e.usage.usageMonitoring]])}
+<p><strong>Custom programs with the identical title (possible duplicates)</strong></p>
+${htmlTable(['Program', 'Title'], e.duplicates.map(d => [d.name, d.title]))}
+${recs.map(recBlock).join('\n')}
+${objectChecks.length ? `${h4('Standard objects named in these recommendations \u2014 live verification')}${htmlTable(['Type', 'Object', 'Exists in this system', 'System description', 'API release state'], objectChecks.map(o => [o.type, o.name, o.exists, o.systemText || '\u2014', o.releaseState || '\u2014']))}` : ''}
+`;
+}
+
+// Inserts the section at the top of the recommendation area (before 4.3 Recommendation) without touching existing content.
+export function insertModernizationSection(doc: string, section: string): string {
+  for (const marker of ['<h3>4.3 Recommendation</h3>', '<h2>Appendix A', '</body>']) {
+    const i = doc.indexOf(marker);
+    if (i >= 0) return doc.slice(0, i) + section + '\n' + doc.slice(i);
+  }
+  return doc + section;
+}
+
+// ---------- process flow diagram (flowchart shapes: VML for Word, SVG for browsers) ----------
+export type FlowStepType = 'start' | 'end' | 'io' | 'process' | 'decision' | 'database' | 'document' | 'subprocess';
+export type FlowBranch = { steps: { type: FlowStepType; label: string }[]; then: string };
+export type FlowNode = { id: string; type: FlowStepType; label: string; yesLabel?: string; noLabel?: string; no?: FlowBranch };
+export type FlowPlan = { nodes: FlowNode[] };
+
+const FLOW_TYPES: FlowStepType[] = ['start', 'end', 'io', 'process', 'decision', 'database', 'document', 'subprocess'];
+const FLOW_COLORS: Record<FlowStepType, { fill: string; stroke: string; name: string }> = {
+  start: { fill: '#f8cfd3', stroke: '#a33a3a', name: 'Start / End' },
+  end: { fill: '#f8cfd3', stroke: '#a33a3a', name: 'Start / End' },
+  io: { fill: '#dbe5f5', stroke: '#35589a', name: 'Input / Output' },
+  process: { fill: '#fde6a6', stroke: '#b8860b', name: 'Process' },
+  decision: { fill: '#fcd2a0', stroke: '#c06000', name: 'Decision' },
+  database: { fill: '#fff1c9', stroke: '#b7791f', name: 'Database table' },
+  document: { fill: '#7ea7e0', stroke: '#23406e', name: 'Document / Report' },
+  subprocess: { fill: '#e5d8f5', stroke: '#6b3fa0', name: 'Function module / BAPI / routine' }
+};
+const FLOW_H: Record<FlowStepType, number> = { start: 38, end: 38, io: 42, process: 42, decision: 64, database: 52, document: 48, subprocess: 42 };
+
+// Deterministic linear flow from the real program structure, used when no AI flow plan is available.
+export function fallbackFlowPlan(f: AbapSpecFacts, ai: AbapSpecNarrative | null): FlowPlan {
+  const nodes: FlowNode[] = [{ id: 'start', type: 'start', label: `Start ${f.name}${f.tcodes.length ? ` (${f.tcodes.join(', ')})` : ''}` }];
+  if (f.selection.length) nodes.push({ id: 'sel', type: 'io', label: `Selection screen: ${f.selection.map(s => s.name).join(', ')}` });
+  const reads = [...new Set(f.selects.flatMap(s => s.tables))];
+  if (reads.length) nodes.push({ id: 'read', type: 'database', label: `Read ${reads.join(', ')}` });
+  f.functions.forEach((x, i) => nodes.push({ id: `fm${i}`, type: 'subprocess', label: `Call ${x.name}` }));
+  if (f.transactionsCalled.length) nodes.push({ id: 'ct', type: 'subprocess', label: `CALL TRANSACTION ${f.transactionsCalled.join(', ')}` });
+  if (f.submits.length) nodes.push({ id: 'sub', type: 'subprocess', label: `SUBMIT ${f.submits.join(', ')}` });
+  const writes = [...new Set(f.writes.map(w => w.table))];
+  if (writes.length) nodes.push({ id: 'write', type: 'database', label: `Update ${writes.join(', ')}` });
+  if (ai?.outputs?.length) nodes.push({ id: 'out', type: 'document', label: `Output: ${ai.outputs[0]}` });
+  nodes.push({ id: 'end', type: 'end', label: 'End' });
+  return { nodes };
+}
+
+// Normalises an AI flow plan; identifiers that do not occur in the real source are marked "(To Be Validated)".
+export function sanitizeFlowPlan(raw: any, f: AbapSpecFacts): FlowPlan | null {
+  if (!raw || !Array.isArray(raw.nodes)) return null;
+  const srcUp = f.source.toUpperCase();
+  const check = (label: string) => {
+    const text = String(label || '').replace(/\s+/g, ' ').trim().slice(0, 70);
+    const unknown = (text.match(/\b[A-Z][A-Z0-9_\/]{3,}\b/g) || []).filter(t => /[_\/0-9]/.test(t) && !srcUp.includes(t));
+    return unknown.length ? `${text} (To Be Validated)` : text;
+  };
+  const nodes: FlowNode[] = [];
+  const seen = new Set<string>();
+  for (const n of raw.nodes.slice(0, 20)) {
+    let type = FLOW_TYPES.includes(n?.type) ? n.type as FlowStepType : 'process';
+    // Start/End only bound the flow; an inline "Exit" becomes a process step.
+    if ((type === 'start' && nodes.length > 0) || (type === 'end' && n !== raw.nodes[Math.min(raw.nodes.length, 20) - 1])) type = 'process';
+    let id = String(n?.id || `n${nodes.length + 1}`);
+    if (seen.has(id)) id = `${id}_${nodes.length}`;
+    seen.add(id);
+    const node: FlowNode = { id, type, label: check(n?.label) || type };
+    if (type === 'decision') {
+      node.yesLabel = String(n?.yesLabel || 'Yes').slice(0, 12);
+      node.noLabel = String(n?.noLabel || 'No').slice(0, 12);
+      const steps = (Array.isArray(n?.no?.steps) ? n.no.steps : []).slice(0, 3)
+        .map((s: any) => ({ type: (['io', 'process', 'database', 'document', 'subprocess'].includes(s?.type) ? s.type : 'process') as FlowStepType, label: check(s?.label) }))
+        .filter((s: any) => s.label);
+      node.no = { steps, then: String(n?.no?.then || 'continue') };
+    }
+    nodes.push(node);
+  }
+  if (nodes.length < 3) return null;
+  if (nodes[0].type !== 'start') nodes.unshift({ id: 'start', type: 'start', label: `Start ${f.name}` });
+  if (nodes[nodes.length - 1].type !== 'end') nodes.push({ id: 'end', type: 'end', label: 'End' });
+  const ids = new Set(nodes.map(n => n.id));
+  nodes.forEach(n => { if (n.no && !['end', 'continue'].includes(n.no.then) && !ids.has(n.no.then)) n.no.then = 'continue'; });
+  return { nodes };
+}
+
+type FlowShape = { type: FlowStepType; x: number; y: number; w: number; h: number; label: string };
+type FlowEdge = { pts: [number, number][]; label?: string; labelAt?: [number, number] };
+
+function layoutFlow(plan: FlowPlan): { W: number; H: number; shapes: FlowShape[]; edges: FlowEdge[] } {
+  const MX = 20, MW = 200, BX = 260, BW = 112, BSTEP = 130, GAP = 34, W = 660;
+  const shapes: FlowShape[] = [];
+  const edges: FlowEdge[] = [];
+  const pos: { y: number; h: number }[] = [];
+  let y = 10;
+  plan.nodes.forEach(n => { const h = FLOW_H[n.type]; pos.push({ y, h }); y += h + GAP; });
+  plan.nodes.forEach((n, i) => shapes.push({ type: n.type, x: MX, y: pos[i].y, w: MW, h: pos[i].h, label: n.label }));
+  const cx = MX + MW / 2;
+  const endIdx = plan.nodes.length - 1;
+  let lane = 0;
+  plan.nodes.forEach((n, i) => {
+    const p = pos[i];
+    if (i < endIdx) edges.push({ pts: [[cx, p.y + p.h], [cx, pos[i + 1].y]], label: n.type === 'decision' ? n.yesLabel : undefined, labelAt: [cx + 6, p.y + p.h + 2] });
+    if (n.type !== 'decision' || !n.no) return;
+    const cy = p.y + p.h / 2;
+    let srcX = MX + MW;
+    n.no.steps.forEach((s, k) => {
+      const h = FLOW_H[s.type];
+      const x = BX + k * BSTEP;
+      shapes.push({ type: s.type, x, y: cy - h / 2, w: BW, h, label: s.label });
+      edges.push({ pts: [[srcX, cy], [x, cy]], label: k === 0 ? n.noLabel : undefined, labelAt: [srcX + 6, cy - 16] });
+      srcX = x + BW;
+    });
+    const targetIdx = n.no.then === 'end' ? endIdx : n.no.then === 'continue' ? i + 1 : plan.nodes.findIndex(m => m.id === n.no!.then);
+    if (targetIdx < 0) return;
+    const laneX = 632 + (lane++ % 3) * 9;
+    const t = pos[targetIdx];
+    const first: FlowEdge = n.no.steps.length ? { pts: [] } : { pts: [], label: n.noLabel, labelAt: [srcX + 6, cy - 16] };
+    first.pts = targetIdx === endIdx
+      ? [[srcX, cy], [laneX, cy], [laneX, t.y + t.h / 2], [MX + MW, t.y + t.h / 2]]
+      : [[srcX, cy], [laneX, cy], [laneX, t.y - 12], [cx, t.y - 12], [cx, t.y]];
+    edges.push(first);
+  });
+  return { W, H: y - GAP + 10, shapes, edges };
+}
+
+const wrapWords = (text: string, max: number) => {
+  const lines: string[] = [];
+  let cur = '';
+  for (const word of text.split(' ')) {
+    if ((cur + ' ' + word).trim().length > max && cur) { lines.push(cur); cur = word; } else cur = (cur + ' ' + word).trim();
+  }
+  if (cur) lines.push(cur);
+  return lines.slice(0, 4);
+};
+
+function flowVml(l: ReturnType<typeof layoutFlow>): string {
+  // Connectors are full-canvas path shapes in the group's own coordinates; Word mis-places chained v:line elements.
+  const canvas = `position:absolute;left:0;top:0;width:${l.W};height:${l.H}`;
+  const path = (pts: [number, number][], stroke: string, arrow: boolean) => `<v:shape style='${canvas}' coordsize='${l.W},${l.H}' path='m ${pts[0][0]},${pts[0][1]} l ${pts.slice(1).map(p => `${p[0]},${p[1]}`).join(' ')} e' filled='f' strokecolor='${stroke}' strokeweight='1pt'>${arrow ? "<v:stroke endarrow='block'/>" : ''}</v:shape>`;
+  const text = (s: FlowShape, inset = '3pt,1pt,3pt,1pt') => `<v:textbox inset='${inset}'><p style='margin:0;text-align:center;font-size:7.5pt;line-height:105%;font-family:Calibri'>${esc(s.label)}</p></v:textbox>`;
+  const shape = (s: FlowShape) => {
+    const c = FLOW_COLORS[s.type];
+    const st = `position:absolute;left:${s.x};top:${s.y};width:${s.w};height:${s.h};v-text-anchor:middle`;
+    const attrs = `fillcolor='${c.fill}' strokecolor='${c.stroke}' strokeweight='1pt'`;
+    switch (s.type) {
+      case 'start': case 'end': return `<v:oval style='${st}' ${attrs}>${text(s)}</v:oval>`;
+      case 'io': return `<v:shape style='${st}' coordsize='100,100' path='m 15,0 l 100,0 85,100 0,100 x e' ${attrs}>${text(s, '10pt,1pt,10pt,1pt')}</v:shape>`;
+      case 'decision': return `<v:shape style='${st}' coordsize='100,100' path='m 50,0 l 100,50 50,100 0,50 x e' ${attrs}>${text(s, '14pt,1pt,14pt,1pt')}</v:shape>`;
+      case 'database': return `<v:shape style='${st}' coordsize='100,100' path='m 0,15 c 0,0 100,0 100,15 l 100,85 c 100,100 0,100 0,85 x e m 0,15 c 0,30 100,30 100,15 e' ${attrs}>${text(s, '3pt,7pt,3pt,1pt')}</v:shape>`;
+      case 'document': return `<v:shape style='${st}' coordsize='100,100' path='m 0,0 l 100,0 100,80 c 75,100 50,60 25,80 c 15,88 5,90 0,85 x e' ${attrs}>${text(s, '3pt,1pt,3pt,5pt')}</v:shape>`;
+      case 'subprocess': return `<v:rect style='${st}' ${attrs}>${text(s, '9pt,1pt,9pt,1pt')}</v:rect>${path([[s.x + 8, s.y], [s.x + 8, s.y + s.h]], c.stroke, false)}${path([[s.x + s.w - 8, s.y], [s.x + s.w - 8, s.y + s.h]], c.stroke, false)}`;
+      default: return `<v:rect style='${st}' ${attrs}>${text(s)}</v:rect>`;
+    }
+  };
+  const edge = (e: FlowEdge) => path(e.pts, '#333333', true)
+    + (e.label && e.labelAt ? `<v:rect style='position:absolute;left:${e.labelAt[0]};top:${e.labelAt[1]};width:48;height:14' filled='f' stroked='f'><v:textbox inset='0,0,0,0'><p style='margin:0;font-size:7pt;font-family:Calibri'>${esc(e.label)}</p></v:textbox></v:rect>` : '');
+  const ptW = 468;
+  return `<v:group style='width:${ptW}pt;height:${Math.round(l.H * ptW / l.W)}pt' coordsize='${l.W},${l.H}' coordorigin='0,0'>${l.edges.map(edge).join('')}${l.shapes.map(shape).join('')}</v:group>`;
+}
+
+function flowSvg(l: ReturnType<typeof layoutFlow>): string {
+  const label = (s: FlowShape, max: number) => {
+    const lines = wrapWords(s.label, max);
+    const top = s.y + s.h / 2 - (lines.length - 1) * 5.5 + 3.5 + (s.type === 'database' ? 4 : 0);
+    return `<text x='${s.x + s.w / 2}' y='${top}' text-anchor='middle' font-family='Calibri,Segoe UI,sans-serif' font-size='9.5'>${lines.map((ln, i) => `<tspan x='${s.x + s.w / 2}' dy='${i ? 11 : 0}'>${esc(ln)}</tspan>`).join('')}</text>`;
+  };
+  const shape = (s: FlowShape) => {
+    const c = FLOW_COLORS[s.type];
+    const a = `fill='${c.fill}' stroke='${c.stroke}' stroke-width='1.2'`;
+    const { x, y, w, h } = s;
+    const max = Math.max(10, Math.floor(w / (s.type === 'decision' ? 8.5 : 5.6)));
+    switch (s.type) {
+      case 'start': case 'end': return `<ellipse cx='${x + w / 2}' cy='${y + h / 2}' rx='${w / 2}' ry='${h / 2}' ${a}/>${label(s, max)}`;
+      case 'io': return `<polygon points='${x + w * 0.15},${y} ${x + w},${y} ${x + w * 0.85},${y + h} ${x},${y + h}' ${a}/>${label(s, max - 4)}`;
+      case 'decision': return `<polygon points='${x + w / 2},${y} ${x + w},${y + h / 2} ${x + w / 2},${y + h} ${x},${y + h / 2}' ${a}/>${label(s, max)}`;
+      case 'database': return `<path d='M${x},${y + h * 0.15} C${x},${y} ${x + w},${y} ${x + w},${y + h * 0.15} L${x + w},${y + h * 0.85} C${x + w},${y + h} ${x},${y + h} ${x},${y + h * 0.85} Z' ${a}/><path d='M${x},${y + h * 0.15} C${x},${y + h * 0.3} ${x + w},${y + h * 0.3} ${x + w},${y + h * 0.15}' fill='none' stroke='${c.stroke}' stroke-width='1.2'/>${label(s, max)}`;
+      case 'document': return `<path d='M${x},${y} L${x + w},${y} L${x + w},${y + h * 0.8} C${x + w * 0.75},${y + h} ${x + w * 0.5},${y + h * 0.6} ${x + w * 0.25},${y + h * 0.8} C${x + w * 0.15},${y + h * 0.88} ${x + w * 0.05},${y + h * 0.9} ${x},${y + h * 0.85} Z' ${a}/>${label(s, max)}`;
+      case 'subprocess': return `<rect x='${x}' y='${y}' width='${w}' height='${h}' ${a}/><line x1='${x + 8}' y1='${y}' x2='${x + 8}' y2='${y + h}' stroke='${c.stroke}'/><line x1='${x + w - 8}' y1='${y}' x2='${x + w - 8}' y2='${y + h}' stroke='${c.stroke}'/>${label(s, max - 3)}`;
+      default: return `<rect x='${x}' y='${y}' width='${w}' height='${h}' ${a}/>${label(s, max)}`;
+    }
+  };
+  const edge = (e: FlowEdge) => `<polyline points='${e.pts.map(p => p.join(',')).join(' ')}' fill='none' stroke='#333' stroke-width='1.2' marker-end='url(#flowArrow)'/>`
+    + (e.label && e.labelAt ? `<text x='${e.labelAt[0]}' y='${e.labelAt[1] + 10}' font-family='Calibri,Segoe UI,sans-serif' font-size='9'>${esc(e.label)}</text>` : '');
+  return `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 ${l.W} ${l.H}' width='100%' style='max-width:${l.W}px'><defs><marker id='flowArrow' markerWidth='8' markerHeight='8' refX='7' refY='4' orient='auto'><path d='M0,0 L8,4 L0,8 Z' fill='#333'/></marker></defs>${l.edges.map(edge).join('')}${l.shapes.map(shape).join('')}</svg>`;
+}
+
+// Process flow diagram of the program in standard flowchart notation (start/end, input/output, process, decision,
+// database, document, function call), built from the flow derived from the real source or, failing that, its real structure.
+export function renderAbapFlowDiagram(f: AbapSpecFacts, ai: AbapSpecNarrative | null, plan?: FlowPlan | null): string {
+  const derived = !!plan;
+  const flow = plan || fallbackFlowPlan(f, ai);
+  const layout = layoutFlow(flow);
+  const legendTypes: FlowStepType[] = ['start', 'io', 'process', 'decision', 'database', 'document', 'subprocess'];
+  const legend = legendTypes.map(t => `<td style='background:${FLOW_COLORS[t].fill};border:1pt solid ${FLOW_COLORS[t].stroke};padding:2pt 6pt;font-size:8pt'>${esc(FLOW_COLORS[t].name)}</td>`).join('');
+  return `
+<h3>Process Flow Diagram</h3>
+<p class='note'>Flowchart of ${esc(f.name)} ${derived ? 'derived from its real source code (conditions, routines, tables and function modules as coded)' : 'built from its live structure (selection screen, tables read and updated, function modules called)'}. Names not found in the source are marked "(To Be Validated)".</p>
+<table align='center' style='border-collapse:separate;border-spacing:4pt;margin:0 auto 8pt auto;width:auto'><tr>${legend}</tr></table>
+<p align='center' style='text-align:center'><!--[if gte vml 1]>${flowVml(layout)}<![endif]--><![if !vml]>${flowSvg(layout)}<![endif]></p>
+`;
+}
+
+// Adds the "Generated By SAP MINDS" mark (top right) and the process flow diagram; existing content is left unchanged.
+export function decorateAbapSpecDocument(doc: string, f: AbapSpecFacts, ai: AbapSpecNarrative | null, plan?: FlowPlan | null): string {
+  let out = doc;
+  // Word only draws the flowchart shapes when the VML namespace is declared on the root element.
+  if (!/xmlns:v=/.test(out)) out = out.replace(/<html\b/, "<html xmlns:v='urn:schemas-microsoft-com:vml'");
+  const brand = `<p style='text-align:right;margin:0 0 6pt 0;font-size:9pt;font-weight:bold;color:#0a3d62;letter-spacing:0.5pt'>Generated By SAP MINDS</p>\n`;
+  const bodyAt = out.indexOf('<body>');
+  out = bodyAt >= 0 ? out.slice(0, bodyAt + 6) + '\n' + brand + out.slice(bodyAt + 6) : brand + out;
+  const diagram = renderAbapFlowDiagram(f, ai, plan);
+  for (const marker of ['<h3>3.9 Runtime errors', '<h2>4. S/4HANA Assessment</h2>', '<h2>Appendix A', '</body>']) {
+    const i = out.indexOf(marker);
+    if (i >= 0) return out.slice(0, i) + diagram + '\n' + out.slice(i);
+  }
+  return out + diagram;
+}
+
 // Picks the real live object a "this program/class/logic" code-generation request is grounded on.
 export async function pickAbapCodeGenTarget(kind: AbapCodeGenTarget): Promise<{ name: string; section: AbapSection; reason: string } | null> {
   if (kind === 'CONVERT_S4') {

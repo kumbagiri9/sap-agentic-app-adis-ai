@@ -253,6 +253,15 @@ async function startServer() {
     res.json({ success: true });
   });
 
+  // Cross-module live update agent — human approval decision on a proposed field change (audited).
+  app.post("/api/live-update/decide", async (req, res) => {
+    const { proposalId, decision } = req.body;
+    const { decideLiveUpdateProposal } = await import("./services/liveUpdateService");
+    const result = await decideLiveUpdateProposal(String(proposalId || ''), decision === 'approve' ? 'approve' : 'reject');
+    appendAudit({ timestamp: new Date().toISOString(), event: 'live_update_decision', proposalId, decision, success: result.success, message: result.message.slice(0, 400) });
+    res.json(result);
+  });
+
   // SD Autonomous Actions — human approval decision on a live S/4HANA write proposal
   app.post("/api/sd-action/decide", async (req, res) => {
     const { proposalId, decision } = req.body;

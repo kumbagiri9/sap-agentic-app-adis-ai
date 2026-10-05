@@ -23,7 +23,11 @@ import { classifySecurityLiveIntent, buildSecurityLiveReport } from "./securityL
 import { classifyBwLiveIntent, buildBwLiveReport } from "./bwLiveDataService";
 import { classifyTmLiveIntent, buildTmLiveReport } from "./tmLiveDataService";
 import { liveIntentCatalogPrompt, resolveLiveIntent, type LiveIntentEntry } from "./liveIntentCatalog";
-import { classifyAbapLiveIntent, buildAbapLiveReport, classifyAbapCodeGenTarget, pickAbapCodeGenTarget, validateGeneratedAbapCode, classifyAbapSpecRequest, collectAbapSpecFacts, verifyStandardCandidates, renderAbapSpecDocument, abapSpecSections, type AbapSection, type AbapSpecNarrative } from "./abapLiveDataService";
+import { UPDATE_TARGETS, fetchEntityMeta, toODataValue, readLiveRecord, registerLiveUpdateProposal, type PropMeta } from "./liveUpdateService";
+import { buildKpiDashboard } from "./kpiDashboardService";
+import { buildPopulationKpiDashboard, attachCompleteDatasetMeta } from "./kpiPopulationService";
+import { classifyScenarioIntent, runScenario, SCENARIO_AGENT } from "./scenarioLiveService";
+import { classifyAbapLiveIntent, buildAbapLiveReport, classifyAbapCodeGenTarget, pickAbapCodeGenTarget, validateGeneratedAbapCode, classifyAbapSpecRequest, collectAbapSpecFacts, verifyStandardCandidates, renderAbapSpecDocument, abapSpecSections, type AbapSection, type AbapSpecNarrative, type AbapSpecFacts, collectModernizationEvidence, apiReleaseStates, renderModernizationSection, insertModernizationSection, decorateAbapSpecDocument, sanitizeFlowPlan, type FlowPlan, MODERNIZATION_AREAS, type ModernizationPlan } from "./abapLiveDataService";
 import { ProcessMiningService } from "./processMiningService";
 import { basisAdminService } from "./basisAdminService";
 import { ppAdminService } from "./ppAdminService";
@@ -4477,7 +4481,7 @@ async function buildNotPaidSalesOrdersReport(): Promise<{ text: string; toolResu
 // Order list with mostly Open/Pending status instead of real cleared invoices. This is the real,
 // dedicated live query: InvoiceClearingStatus eq 'C' (genuinely paid/cleared) restricted to last
 // calendar month's real BillingDocumentDate range.
-async function buildPaidInvoicesReport(period: 'last month' | 'this month' | 'all'): Promise<{ text: string; toolResults: ToolResult[] } | null> {
+async function buildPaidInvoicesReport(period: 'last month' | 'this month' | 'all' | { year: number }): Promise<{ text: string; toolResults: ToolResult[] } | null> {
   const now = new Date();
   const thisMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
   const lastMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
@@ -4485,7 +4489,10 @@ async function buildPaidInvoicesReport(period: 'last month' | 'this month' | 'al
 
   let filter = `$filter=InvoiceClearingStatus eq 'C'`;
   let periodLabel = 'all time';
-  if (period === 'last month') {
+  if (typeof period === 'object') {
+    filter += ` and BillingDocumentDate ge datetime'${period.year}-01-01T00:00:00' and BillingDocumentDate lt datetime'${period.year + 1}-01-01T00:00:00'`;
+    periodLabel = `the year ${period.year}`;
+  } else if (period === 'last month') {
     filter += ` and BillingDocumentDate ge datetime'${fmt(lastMonthStart)}T00:00:00' and BillingDocumentDate lt datetime'${fmt(thisMonthStart)}T00:00:00'`;
     periodLabel = 'last month';
   } else if (period === 'this month') {
@@ -4494,8 +4501,16 @@ async function buildPaidInvoicesReport(period: 'last month' | 'this month' | 'al
   }
   filter += `&$select=BillingDocument,SoldToParty,BillingDocumentDate,InvoiceClearingStatus,TotalNetAmount,TransactionCurrency&$top=1000`;
 
-  const billingResult = await sapApi.queryS8HOData('API_BILLING_DOCUMENT_SRV', 'A_BillingDocument', filter);
+  let billingResult = await sapApi.queryS8HOData('API_BILLING_DOCUMENT_SRV', 'A_BillingDocument', filter);
   if (billingResult?.error || !Array.isArray(billingResult)) return null;
+  // A named year is read completely (page by page) so the total covers every paid invoice of that year.
+  if (typeof period === 'object') {
+    for (let skip = 1000; billingResult.length === skip && skip < 100000; skip += 1000) {
+      const page = await sapApi.queryS8HOData('API_BILLING_DOCUMENT_SRV', 'A_BillingDocument', `${filter}&$skip=${skip}`);
+      if (page?.error || !Array.isArray(page)) return null;
+      billingResult = billingResult.concat(page);
+    }
+  }
 
   const rows = billingResult.map((d: any) => ({
     InvoiceNumber: d.BillingDocument,
@@ -4506,6 +4521,37 @@ async function buildPaidInvoicesReport(period: 'last month' | 'this month' | 'al
     TransactionCurrency: d.TransactionCurrency
   }));
 
+  if (typeof period === 'object') {
+    const byCurrency = new Map<string, { count: number; amount: number }>();
+    rows.forEach((r: any) => {
+      const c = String(r.TransactionCurrency || '\u2014');
+      const e = byCurrency.get(c) || { count: 0, amount: 0 };
+      e.count++; e.amount += Number(r.TotalNetAmount) || 0;
+      byCurrency.set(c, e);
+    });
+    const totals = [...byCurrency.entries()].sort((a, b) => b[1].amount - a[1].amount);
+    const money = (v: number) => v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return {
+      text: rows.length
+        ? `Live S/4HANA API_BILLING_DOCUMENT_SRV/A_BillingDocument returned ${rows.length} paid/cleared invoice(s) (InvoiceClearingStatus = 'C') with a billing date in ${period.year}. Total net amount: ${totals.map(([c, e]) => `${money(e.amount)} ${c} (${e.count} invoice${e.count === 1 ? '' : 's'})`).join('; ')}.${totals.length > 1 ? ' Amounts in different currencies are shown separately, not converted.' : ''}`
+        : `Live S/4HANA API_BILLING_DOCUMENT_SRV/A_BillingDocument has no paid/cleared invoice (InvoiceClearingStatus = 'C') with a billing date in ${period.year}.`,
+      toolResults: [
+        ...(rows.length ? [{
+          type: 'mm_live_report', toolName: 'queryLiveS8HOData', agentName: AGENTS.SD_ORCHESTRATOR.name,
+          data: {
+            reportTitle: `Paid Invoices ${period.year} \u2014 Total Net Amount by Currency`,
+            summaryStats: [{ label: 'Paid invoices', value: String(rows.length) }, ...totals.map(([c, e]) => ({ label: `Total ${c}`, value: money(e.amount) }))],
+            columns: [{ key: 'currency', label: 'Currency' }, { key: 'count', label: 'Paid Invoices' }, { key: 'amount', label: 'Total Net Amount' }],
+            rows: totals.map(([c, e]) => ({ currency: c, count: e.count, amount: money(e.amount) })),
+            note: `Billing documents with InvoiceClearingStatus = 'C' and BillingDocumentDate from ${period.year}-01-01 to ${period.year}-12-31, read live from API_BILLING_DOCUMENT_SRV (all pages).`,
+            completeDataset: billingResult.length < 100000
+          }
+        } as ToolResult] : []),
+        { type: 'live_odata_records', toolName: 'queryLiveS8HOData', agentName: AGENTS.SD_ORCHESTRATOR.name, data: rows }
+      ]
+    };
+  }
+
   return {
     text: `Live S/4HANA API_BILLING_DOCUMENT_SRV/A_BillingDocument returned ${rows.length} paid/cleared invoice(s) (InvoiceClearingStatus = 'C') for ${periodLabel}.`,
     toolResults: [{
@@ -4515,6 +4561,308 @@ async function buildPaidInvoicesReport(period: 'last month' | 'this month' | 'al
       data: rows
     }]
   };
+}
+
+// Paid vendor (AP) invoices from the live cleared supplier items (BSAK_VIEW). An invoice line is a supplier credit
+// line whose posting key (TBSL) is sales-relevant and not a payment; it counts as paid only when its clearing document
+// contains a supplier payment line (TBSL-XZAHL = 'X'). Year = invoice posting date; this/last month = payment (clearing) date.
+async function buildPaidVendorInvoicesReport(period: 'last month' | 'this month' | 'all' | { year: number }): Promise<{ text: string; toolResults: ToolResult[] } | null> {
+  const clean = (r: any) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, String(v ?? '').trim()])) as Record<string, string>;
+  const amount = (v: string) => { const neg = /-$/.test(v); const x = Number(v.replace(/-$/, '')); return Number.isFinite(x) ? (neg ? -x : x) : 0; };
+  const isoDate = (s: string) => /^\d{8}$/.test(s) && s !== '00000000' ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6)}` : '';
+  const d8 = (d: Date) => d.toISOString().slice(0, 10).replace(/-/g, '');
+  const now = new Date();
+  const thisMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const lastMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+  const lastMonthEnd = new Date(thisMonthStart.getTime() - 86400000);
+
+  let dateFilter = '';
+  let periodLabel = 'all time';
+  if (typeof period === 'object') {
+    dateFilter = ` AND A~BUDAT >= '${period.year}0101' AND A~BUDAT <= '${period.year}1231'`;
+    periodLabel = `posted in ${period.year}`;
+  } else if (period === 'last month') {
+    dateFilter = ` AND A~AUGDT >= '${d8(lastMonthStart)}' AND A~AUGDT <= '${d8(lastMonthEnd)}'`;
+    periodLabel = 'paid last month';
+  } else if (period === 'this month') {
+    dateFilter = ` AND A~AUGDT >= '${d8(thisMonthStart)}'`;
+    periodLabel = 'paid this month';
+  }
+  const sql = `SELECT A~BUKRS, A~LIFNR, A~BELNR, A~GJAHR, A~BUZEI, A~BUDAT, A~BLDAT, A~BLART, A~XBLNR, A~WRBTR, A~WAERS, A~AUGBL, A~AUGDT, A~AUGGJ FROM BSAK_VIEW AS A INNER JOIN TBSL AS B ON A~BSCHL = B~BSCHL WHERE B~KOART = 'K' AND B~SHKZG = 'H' AND B~XZAHL = ' ' AND B~XUMSW = 'X' AND A~UMSKZ = ' '${dateFilter}`;
+  const inv = await executeReadOnlySelect(sql, 100000);
+  if ('error' in inv) {
+    return {
+      text: `The paid vendor invoices could not be read from the live system: ${inv.error} No mock or estimated data is substituted.`,
+      toolResults: [{ type: 'fico_service_unavailable', toolName: 'apLiveData', agentName: AGENTS.FICO_LIVE_AGENT.name, data: { service: 'BSAK_VIEW (cleared supplier items)', reason: inv.error } } as ToolResult]
+    };
+  }
+  const lines = inv.rows.map(clean);
+  const complete = Number(inv.totalRows || 0) <= lines.length;
+
+  // Clearing documents that contain a supplier payment line.
+  const paidKeys = new Set<string>();
+  const clearingDocs = [...new Set(lines.map(l => l.AUGBL).filter(Boolean))];
+  for (let i = 0; i < clearingDocs.length; i += 80) {
+    const list = clearingDocs.slice(i, i + 80).map(b => `'${b.replace(/'/g, "''")}'`).join(', ');
+    const pay = await executeReadOnlySelect(`SELECT A~BUKRS, A~BELNR, A~GJAHR FROM BSEG AS A INNER JOIN TBSL AS B ON A~BSCHL = B~BSCHL WHERE A~KOART = 'K' AND B~XZAHL = 'X' AND A~BELNR IN ( ${list} )`, 100000);
+    if ('error' in pay) {
+      return {
+        text: `The payment documents for the cleared vendor invoices could not be read from the live system: ${pay.error} No mock or estimated data is substituted.`,
+        toolResults: [{ type: 'fico_service_unavailable', toolName: 'apLiveData', agentName: AGENTS.FICO_LIVE_AGENT.name, data: { service: 'BSEG (payment documents)', reason: pay.error } } as ToolResult]
+      };
+    }
+    pay.rows.map(clean).forEach(p => paidKeys.add(`${p.BUKRS}|${p.BELNR}|${p.GJAHR}`));
+  }
+  const paid = lines.filter(l => paidKeys.has(`${l.BUKRS}|${l.AUGBL}|${l.AUGGJ}`));
+  const clearedOtherwise = lines.length - paid.length;
+
+  const names = new Map<string, string>();
+  const lifnrs = [...new Set(paid.map(l => l.LIFNR).filter(Boolean))];
+  for (let i = 0; i < lifnrs.length; i += 80) {
+    const r = await executeReadOnlySelect(`SELECT LIFNR, NAME1 FROM LFA1 WHERE LIFNR IN ( ${lifnrs.slice(i, i + 80).map(x => `'${x.replace(/'/g, "''")}'`).join(', ')} )`, 1000);
+    if (!('error' in r)) r.rows.map(clean).forEach(x => names.set(x.LIFNR, x.NAME1));
+  }
+
+  const rows = paid
+    .map(l => ({
+      InvoiceDocument: l.BELNR,
+      CompanyCode: l.BUKRS,
+      FiscalYear: l.GJAHR,
+      Supplier: l.LIFNR.replace(/^0+(?=\d)/, ''),
+      SupplierName: names.get(l.LIFNR) || '',
+      SupplierInvoiceReference: l.XBLNR,
+      DocumentType: l.BLART,
+      PostingDate: isoDate(l.BUDAT),
+      PaymentDate: isoDate(l.AUGDT),
+      PaymentDocument: l.AUGBL,
+      DaysToPay: l.BUDAT && l.AUGDT ? Math.round((Date.UTC(+l.AUGDT.slice(0, 4), +l.AUGDT.slice(4, 6) - 1, +l.AUGDT.slice(6)) - Date.UTC(+l.BUDAT.slice(0, 4), +l.BUDAT.slice(4, 6) - 1, +l.BUDAT.slice(6))) / 86400000) : '',
+      InvoiceAmount: amount(l.WRBTR).toFixed(2),
+      Currency: l.WAERS
+    }))
+    .sort((a, b) => Number(b.InvoiceAmount) - Number(a.InvoiceAmount));
+
+  const byCurrency = new Map<string, { count: number; amount: number }>();
+  rows.forEach(r => {
+    const c = r.Currency || '\u2014';
+    const e = byCurrency.get(c) || { count: 0, amount: 0 };
+    e.count++; e.amount += Number(r.InvoiceAmount) || 0;
+    byCurrency.set(c, e);
+  });
+  const totals = [...byCurrency.entries()].sort((a, b) => b[1].amount - a[1].amount);
+  const money = (v: number) => v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const suppliers = new Set(rows.map(r => r.Supplier)).size;
+  const basis = typeof period === 'object' ? `invoice posting date in ${period.year}` : period === 'all' ? 'all posting dates' : `payment date ${period}`;
+  const otherNote = clearedOtherwise > 0 ? ` ${clearedOtherwise} further cleared invoice line(s) ${periodLabel} were cleared without a supplier payment (e.g. against a credit memo or a reversal) and are not counted as paid.` : '';
+  const note = `Supplier invoice lines (posting keys with TBSL-KOART = 'K', credit side, sales-relevant, not a payment) from the cleared supplier items BSAK_VIEW, ${basis}, whose clearing document contains a supplier payment line (TBSL-XZAHL = 'X'). Amounts are in the invoice currency (BSAK-WRBTR).${complete ? '' : ` Only ${lines.length} of ${inv.totalRows} matching invoice lines could be read, so totals cover those lines only.`}`;
+
+  const text = rows.length
+    ? `Live S/4HANA accounts payable: ${rows.length} paid vendor invoice(s) ${periodLabel} from ${suppliers} supplier(s). Total invoice amount: ${totals.map(([c, e]) => `${money(e.amount)} ${c} (${e.count} invoice${e.count === 1 ? '' : 's'})`).join('; ')}.${totals.length > 1 ? ' Amounts in different currencies are shown separately, not converted.' : ''}${otherNote}`
+    : `Live S/4HANA accounts payable has no paid vendor invoice ${periodLabel} (cleared supplier items checked in BSAK_VIEW).${otherNote}`;
+
+  return {
+    text,
+    toolResults: [
+      ...(rows.length ? [{
+        type: 'mm_live_report', toolName: 'apLiveData', agentName: AGENTS.FICO_LIVE_AGENT.name,
+        data: {
+          reportTitle: `Paid Vendor Invoices${typeof period === 'object' ? ` ${period.year}` : period === 'all' ? '' : ` \u2014 ${period}`} \u2014 Total by Currency`,
+          summaryStats: [{ label: 'Paid vendor invoices', value: String(rows.length) }, { label: 'Suppliers', value: String(suppliers) }, ...totals.map(([c, e]) => ({ label: `Total ${c}`, value: money(e.amount) }))],
+          columns: [{ key: 'currency', label: 'Currency' }, { key: 'count', label: 'Paid Invoices' }, { key: 'amount', label: 'Total Invoice Amount' }],
+          rows: totals.map(([c, e]) => ({ currency: c, count: e.count, amount: money(e.amount) })),
+          note,
+          completeDataset: complete
+        }
+      } as ToolResult] : []),
+      { type: 'live_odata_records', toolName: 'apLiveData', agentName: AGENTS.FICO_LIVE_AGENT.name, data: rows }
+    ]
+  };
+}
+
+// Outbound deliveries of one calendar year, read completely (all pages) from API_OUTBOUND_DELIVERY_SRV.
+// dateBasis: 'created' = CreationDate (LIKP-ERDAT), 'goods issue' = ActualGoodsMovementDate, otherwise DeliveryDate (LIKP-LFDAT).
+async function buildDeliveriesForYearReport(year: number, dateBasis: 'delivery' | 'created' | 'goods issue'): Promise<{ text: string; toolResults: ToolResult[] } | null> {
+  const field = dateBasis === 'created' ? 'CreationDate' : dateBasis === 'goods issue' ? 'ActualGoodsMovementDate' : 'DeliveryDate';
+  const basisLabel = dateBasis === 'created' ? 'created' : dateBasis === 'goods issue' ? 'with goods issue posted' : 'with a delivery date';
+  const filter = `$filter=${field} ge datetime'${year}-01-01T00:00:00' and ${field} lt datetime'${year + 1}-01-01T00:00:00'&$select=DeliveryDocument,DeliveryDocumentType,CreationDate,DeliveryDate,ActualGoodsMovementDate,ShippingPoint,SoldToParty,ShipToParty,OverallGoodsMovementStatus,OverallSDProcessStatus&$orderby=${field} desc&$top=1000`;
+  let all = await sapApi.queryS8HOData('API_OUTBOUND_DELIVERY_SRV', 'A_OutbDeliveryHeader', filter);
+  if (all?.error || !Array.isArray(all)) return null;
+  for (let skip = 1000; all.length === skip && skip < 100000; skip += 1000) {
+    const page = await sapApi.queryS8HOData('API_OUTBOUND_DELIVERY_SRV', 'A_OutbDeliveryHeader', `${filter}&$skip=${skip}`);
+    if (page?.error || !Array.isArray(page)) return null;
+    all = all.concat(page);
+  }
+  const gmText: Record<string, string> = { A: 'Not yet started', B: 'Partially processed', C: 'Completely processed', '': 'Not relevant' };
+  const rows = all.map((d: any) => ({
+    delivery: d.DeliveryDocument,
+    type: d.DeliveryDocumentType || '\u2014',
+    created: odataDateToIso(d.CreationDate) || '\u2014',
+    deliveryDate: odataDateToIso(d.DeliveryDate) || '\u2014',
+    goodsIssue: odataDateToIso(d.ActualGoodsMovementDate) || '\u2014',
+    shippingPoint: d.ShippingPoint || '\u2014',
+    soldTo: d.SoldToParty || '\u2014',
+    shipTo: d.ShipToParty || '\u2014',
+    goodsMovement: gmText[d.OverallGoodsMovementStatus ?? ''] ?? d.OverallGoodsMovementStatus
+  }));
+  const byGm = new Map<string, number>();
+  rows.forEach((r: any) => byGm.set(r.goodsMovement, (byGm.get(r.goodsMovement) || 0) + 1));
+  const byMonth = new Map<string, number>();
+  rows.forEach((r: any) => { const k = String(dateBasis === 'created' ? r.created : dateBasis === 'goods issue' ? r.goodsIssue : r.deliveryDate).slice(0, 7); byMonth.set(k, (byMonth.get(k) || 0) + 1); });
+  const text = rows.length
+    ? `Live S/4HANA API_OUTBOUND_DELIVERY_SRV returned ${rows.length} outbound deliver${rows.length === 1 ? 'y' : 'ies'} ${basisLabel} in ${year}. Goods movement status: ${[...byGm.entries()].map(([k, v]) => `${k} ${v}`).join(', ')}.${dateBasis === 'delivery' ? ' (Filtered on delivery date; ask "deliveries created in ' + year + '" to filter on creation date.)' : ''}`
+    : `Live S/4HANA API_OUTBOUND_DELIVERY_SRV has no outbound delivery ${basisLabel} in ${year}.`;
+  return {
+    text,
+    toolResults: [{
+      type: 'mm_live_report', toolName: 'queryLiveS8HOData', agentName: AGENTS.SD_ORCHESTRATOR.name,
+      data: {
+        reportTitle: `Outbound Deliveries ${year} (${field})`,
+        summaryStats: [{ label: 'Deliveries', value: String(rows.length) }, ...[...byGm.entries()].map(([k, v]) => ({ label: k, value: String(v) })), { label: 'Months', value: String(byMonth.size) }],
+        columns: [
+          { key: 'delivery', label: 'Delivery' }, { key: 'type', label: 'Type' }, { key: 'created', label: 'Created On' }, { key: 'deliveryDate', label: 'Delivery Date' },
+          { key: 'goodsIssue', label: 'Goods Issue Date' }, { key: 'shippingPoint', label: 'Shipping Point' }, { key: 'soldTo', label: 'Sold-To' }, { key: 'shipTo', label: 'Ship-To' }, { key: 'goodsMovement', label: 'Goods Movement' }
+        ],
+        rows,
+        note: `Outbound delivery headers with ${field} from ${year}-01-01 to ${year}-12-31, read live from API_OUTBOUND_DELIVERY_SRV/A_OutbDeliveryHeader (all pages).`,
+        pageSize: 25,
+        downloadable: true,
+        completeDataset: all.length < 100000
+      }
+    } as ToolResult]
+  };
+}
+
+// Sales period named in a question ("last two years", "last 6 months", "this year", "last year", "2025"); default last 12 months.
+function parseSalesPeriod(q: string): { from: string; to: string; label: string } {
+  const words: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12 };
+  const today = new Date();
+  const ymd = (d: Date) => `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+  const iso = (s: string) => `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+  const rel = q.match(/\b(?:last|past|previous)\s+(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(year|month|week|day)s?\b/);
+  if (rel) {
+    const n = /^\d+$/.test(rel[1]) ? Number(rel[1]) : words[rel[1]];
+    const from = new Date(today);
+    if (rel[2] === 'year') from.setFullYear(from.getFullYear() - n);
+    else if (rel[2] === 'month') from.setMonth(from.getMonth() - n);
+    else from.setDate(from.getDate() - n * (rel[2] === 'week' ? 7 : 1));
+    return { from: ymd(from), to: ymd(today), label: `the last ${n} ${rel[2]}${n === 1 ? '' : 's'} (${iso(ymd(from))} to ${iso(ymd(today))})` };
+  }
+  const y = today.getFullYear();
+  if (/\bthis year\b|\bytd\b|year to date/.test(q)) return { from: `${y}0101`, to: ymd(today), label: `this year (${y}-01-01 to ${iso(ymd(today))})` };
+  if (/\blast year\b/.test(q)) return { from: `${y - 1}0101`, to: `${y - 1}1231`, label: `${y - 1}` };
+  const yearMatch = q.match(/\b(20\d{2})\b/);
+  if (yearMatch) return { from: `${yearMatch[1]}0101`, to: `${yearMatch[1]}1231`, label: yearMatch[1] };
+  const from = new Date(today); from.setFullYear(from.getFullYear() - 1);
+  return { from: ymd(from), to: ymd(today), label: `the last 12 months (${iso(ymd(from))} to ${iso(ymd(today))})` };
+}
+
+// Best-selling materials: billed quantity and net value per material from live billing documents (VBRK/VBRP),
+// customer invoices only (cancelled invoices excluded), ranked by net sales value.
+async function buildBestSellingMaterialsReport(query: string): Promise<{ text: string; toolResults: ToolResult[] } | null> {
+  const q = normalizeSdPrompt(query);
+  const period = parseSalesPeriod(q);
+  const topN = Math.min(extractRequestedObjectLimit(query) || 10, 100);
+  const byQuantity = /\b(quantity|volume|units|pieces)\b/.test(q);
+  const agg = await executeReadOnlySelect(`SELECT p~MATNR, k~WAERK, p~VRKME, SUM( p~FKIMG ) AS QTY, SUM( p~NETWR ) AS NETVAL, COUNT( DISTINCT k~VBELN ) AS DOCS, COUNT( DISTINCT k~KUNAG ) AS CUSTOMERS FROM VBRP AS p INNER JOIN VBRK AS k ON k~VBELN = p~VBELN WHERE k~FKDAT >= '${period.from}' AND k~FKDAT <= '${period.to}' AND k~VBTYP = 'M' AND k~FKSTO = '' AND p~MATNR <> '' GROUP BY p~MATNR, k~WAERK, p~VRKME`, 5000);
+  if ('error' in agg) return null;
+  const rowsRaw = agg.rows.map((r: any) => ({ matnr: String(r.MATNR).trim(), currency: String(r.WAERK).trim(), uom: String(r.VRKME).trim(), qty: Number(String(r.QTY).trim()) || 0, value: Number(String(r.NETVAL).trim()) || 0, docs: Number(String(r.DOCS).trim()) || 0, customers: Number(String(r.CUSTOMERS).trim()) || 0 }));
+  const currencies = [...new Set(rowsRaw.map(r => r.currency))];
+  const uoms = [...new Set(rowsRaw.map(r => r.uom))];
+  const [dec, uomText] = await Promise.all([
+    currencies.length ? executeReadOnlySelect(`SELECT CURRKEY, CURRDEC FROM TCURX WHERE CURRKEY IN ( ${currencies.map(c => `'${c}'`).join(', ')} )`, 50) : Promise.resolve({ rows: [] as any[] }),
+    uoms.length ? executeReadOnlySelect(`SELECT MSEHI, MSEH3 FROM T006A WHERE SPRAS = 'E' AND MSEHI IN ( ${uoms.map(u => `'${u}'`).join(', ')} )`, 100) : Promise.resolve({ rows: [] as any[] })
+  ]);
+  const decimals = new Map<string, number>(('error' in dec ? [] : dec.rows).map((r: any) => [String(r.CURRKEY).trim(), Number(String(r.CURRDEC).trim())]));
+  const uomExt = new Map<string, string>(('error' in uomText ? [] : uomText.rows).map((r: any) => [String(r.MSEHI).trim(), String(r.MSEH3).trim()]));
+  rowsRaw.forEach(r => { r.value = r.value * Math.pow(10, 2 - (decimals.get(r.currency) ?? 2)); });
+  // Rank within the currency that carries the most sales volume, so values are never added across currencies.
+  const valueByCur = new Map<string, number>();
+  rowsRaw.forEach(r => valueByCur.set(r.currency, (valueByCur.get(r.currency) || 0) + r.value));
+  const mainCurrency = [...valueByCur.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || '';
+  const ranked = rowsRaw.filter(r => byQuantity || r.currency === mainCurrency).sort((a, b) => byQuantity ? b.qty - a.qty : b.value - a.value).slice(0, topN);
+  const mats = [...new Set(ranked.map(r => r.matnr))];
+  const makt = mats.length ? await executeReadOnlySelect(`SELECT MATNR, MAKTX FROM MAKT WHERE SPRAS = 'E' AND MATNR IN ( ${mats.map(m => `'${m.replace(/'/g, '')}'`).join(', ')} )`, 200) : { rows: [] as any[] };
+  const desc = new Map<string, string>(('error' in makt ? [] : makt.rows).map((r: any) => [String(r.MATNR).trim(), String(r.MAKTX).trim()]));
+  const money = (v: number, c: string) => `${v.toLocaleString('en-US', { minimumFractionDigits: decimals.get(c) ?? 2, maximumFractionDigits: decimals.get(c) ?? 2 })} ${c}`;
+  const display = (m: string) => /^0+\d+$/.test(m) ? m.replace(/^0+/, '') : m;
+  const totalMain = valueByCur.get(mainCurrency) || 0;
+  const rows = ranked.map((r, i) => ({
+    rank: i + 1, material: display(r.matnr), description: desc.get(r.matnr) || '\u2014',
+    quantity: `${r.qty.toLocaleString('en-US')} ${uomExt.get(r.uom) || r.uom}`, netSales: money(r.value, r.currency),
+    share: totalMain && r.currency === mainCurrency ? `${(r.value / totalMain * 100).toFixed(1)}%` : '\u2014', invoices: r.docs, customers: r.customers
+  }));
+  const other = [...valueByCur.entries()].filter(([c]) => c !== mainCurrency);
+  const top = rows[0];
+  const text = rows.length
+    ? `Best-selling material for ${period.label}: **${top.material}${top.description !== '\u2014' ? ` (${top.description})` : ''}** with ${top.netSales} net sales (${top.quantity}, ${top.invoices} invoice(s), ${top.share} of ${mainCurrency} sales). Top ${rows.length} by ${byQuantity ? 'billed quantity' : 'net sales value'}: ${rows.slice(0, 5).map(r => `${r.rank}. ${r.material} ${r.netSales}`).join('; ')}.${other.length && !byQuantity ? ` Sales in other currencies are not mixed into this ranking: ${other.map(([c, v]) => money(v, c)).join(', ')}.` : ''}`
+    : `No billed sales (customer invoices) were found for ${period.label} in the live S/4HANA billing documents.`;
+  const result = buildMmReportResult('hanaDbIntelligence', text,
+    `Best-Selling Materials \u2014 ${period.label}`,
+    [{ label: 'Materials sold', value: String(rowsRaw.filter(r => r.currency === mainCurrency).length) }, { label: `Total net sales (${mainCurrency})`, value: money(totalMain, mainCurrency) }, { label: 'Ranked by', value: byQuantity ? 'Billed quantity' : 'Net sales value' }],
+    [{ key: 'rank', label: '#' }, { key: 'material', label: 'Material' }, { key: 'description', label: 'Description' }, { key: 'quantity', label: 'Billed Quantity' }, { key: 'netSales', label: 'Net Sales' }, { key: 'share', label: 'Share' }, { key: 'invoices', label: 'Invoices' }, { key: 'customers', label: 'Customers' }],
+    rows,
+    `Read live from the billing documents (VBRK/VBRP): customer invoices (document category M) with billing date ${period.from.slice(0, 4)}-${period.from.slice(4, 6)}-${period.from.slice(6)} to ${period.to.slice(0, 4)}-${period.to.slice(4, 6)}-${period.to.slice(6)}, cancelled invoices excluded; credit memos and cancellation documents are not netted. Net value in document currency; ranking within ${mainCurrency}.`
+  );
+  (result.toolResults[0].data as any).downloadable = true;
+  return result;
+}
+
+// All line items of one purchase order (header context, items and their first delivery date) from API_PURCHASEORDER_PROCESS_SRV.
+async function buildPurchaseOrderItemsReport(poNumber: string): Promise<{ text: string; toolResults: ToolResult[] } | null> {
+  const [hdrRes, itemRes, schedRes] = await Promise.all([
+    sapApi.queryS8HOData('API_PURCHASEORDER_PROCESS_SRV', 'A_PurchaseOrder', `$filter=PurchaseOrder eq '${poNumber}'&$select=PurchaseOrder,PurchaseOrderType,Supplier,CompanyCode,PurchasingOrganization,PurchasingGroup,DocumentCurrency,CreationDate,CreatedByUser,PurchaseOrderDate&$top=1`),
+    sapApi.queryS8HOData('API_PURCHASEORDER_PROCESS_SRV', 'A_PurchaseOrderItem', `$filter=PurchaseOrder eq '${poNumber}'&$select=PurchaseOrder,PurchaseOrderItem,Material,PurchaseOrderItemText,Plant,StorageLocation,MaterialGroup,OrderQuantity,PurchaseOrderQuantityUnit,NetPriceAmount,NetPriceQuantity,DocumentCurrency,IsCompletelyDelivered,IsFinallyInvoiced,PurchasingDocumentDeletionCode&$top=1000`),
+    sapApi.queryS8HOData('API_PURCHASEORDER_PROCESS_SRV', 'A_PurchaseOrderScheduleLine', `$filter=PurchasingDocument eq '${poNumber}'&$select=PurchasingDocument,PurchasingDocumentItem,ScheduleLineDeliveryDate&$top=5000`)
+  ]);
+  if (itemRes?.error || !Array.isArray(itemRes)) return null;
+  const hdr = Array.isArray(hdrRes) ? hdrRes[0] : null;
+  if (!hdr && !itemRes.length) {
+    return buildMmReportResult('queryLiveS8HOData', `Purchase order ${poNumber} does not exist in the live S/4HANA system.`, `Purchase Order ${poNumber} \u2014 Line Items`, [{ label: 'Items', value: '0' }], [{ key: 'item', label: 'Item' }], [], 'Read live from API_PURCHASEORDER_PROCESS_SRV.');
+  }
+  const supplierRes = hdr?.Supplier ? await sapApi.queryS8HOData('API_BUSINESS_PARTNER', 'A_Supplier', `$filter=Supplier eq '${hdr.Supplier}'&$select=Supplier,SupplierName&$top=1`) : null;
+  const supplierNameRaw = Array.isArray(supplierRes) ? supplierRes[0]?.SupplierName || '' : '';
+  const supplierName = supplierNameRaw && supplierNameRaw !== hdr?.Supplier ? supplierNameRaw : '';
+  const firstDate = new Map<string, string>();
+  if (Array.isArray(schedRes)) {
+    schedRes.forEach((s: any) => {
+      const d = odataDateToIso(s.ScheduleLineDeliveryDate) || '';
+      const k = String(s.PurchasingDocumentItem).replace(/^0+/, '');
+      if (d && (!firstDate.has(k) || d < firstDate.get(k)!)) firstDate.set(k, d);
+    });
+  }
+  const cur = hdr?.DocumentCurrency || itemRes[0]?.DocumentCurrency || '';
+  const money = (v: number) => `${v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${cur}`.trim();
+  let total = 0;
+  const rows = itemRes.sort((a: any, b: any) => Number(a.PurchaseOrderItem) - Number(b.PurchaseOrderItem)).map((it: any) => {
+    const qty = Number(it.OrderQuantity) || 0;
+    const price = Number(it.NetPriceAmount) || 0;
+    const per = Number(it.NetPriceQuantity) || 1;
+    const value = qty * price / per;
+    if (!it.PurchasingDocumentDeletionCode) total += value;
+    const itemNo = String(it.PurchaseOrderItem).replace(/^0+/, '');
+    return {
+      item: itemNo, material: it.Material || '\u2014', description: it.PurchaseOrderItemText || '\u2014', plant: it.Plant || '\u2014', storageLocation: it.StorageLocation || '\u2014',
+      quantity: `${qty.toLocaleString('en-US')} ${it.PurchaseOrderQuantityUnit || ''}`.trim(), netPrice: `${money(price)}${per !== 1 ? ` / ${per}` : ''}`, netValue: money(value),
+      deliveryDate: firstDate.get(itemNo) || '\u2014',
+      status: it.PurchasingDocumentDeletionCode ? 'Deleted' : it.IsCompletelyDelivered ? (it.IsFinallyInvoiced ? 'Delivered & invoiced' : 'Delivered') : 'Open'
+    };
+  });
+  const result = buildMmReportResult('queryLiveS8HOData',
+    `Purchase order ${poNumber}${hdr ? ` (type ${hdr.PurchaseOrderType}, supplier ${hdr.Supplier}${supplierName ? ` ${supplierName}` : ''}, company code ${hdr.CompanyCode}, created ${odataDateToIso(hdr.CreationDate) || '\u2014'} by ${hdr.CreatedByUser || '\u2014'})` : ''} has ${rows.length} line item(s) with a total net value of ${money(total)}${rows.some((r: any) => r.status === 'Deleted') ? ' (deleted items excluded from the total)' : ''}.`,
+    `Purchase Order ${poNumber} \u2014 Line Items`,
+    [
+      { label: 'Line items', value: String(rows.length) },
+      { label: 'Total net value', value: money(total) },
+      ...(hdr ? [{ label: 'Supplier', value: `${hdr.Supplier}${supplierName ? ` \u2014 ${supplierName}` : ''}` }, { label: 'Purch. org / group', value: `${hdr.PurchasingOrganization || '\u2014'} / ${hdr.PurchasingGroup || '\u2014'}` }] : [])
+    ],
+    [
+      { key: 'item', label: 'Item' }, { key: 'material', label: 'Material' }, { key: 'description', label: 'Short Text' }, { key: 'plant', label: 'Plant' }, { key: 'storageLocation', label: 'Stor. Loc.' },
+      { key: 'quantity', label: 'Quantity' }, { key: 'netPrice', label: 'Net Price' }, { key: 'netValue', label: 'Net Value' }, { key: 'deliveryDate', label: 'Delivery Date' }, { key: 'status', label: 'Status' }
+    ],
+    rows,
+    'Read live from API_PURCHASEORDER_PROCESS_SRV (A_PurchaseOrder, A_PurchaseOrderItem, A_PurchaseOrderScheduleLine) and the supplier name from API_BUSINESS_PARTNER. Net value = quantity \u00d7 net price / price unit.'
+  );
+  if (rows.length > 25) Object.assign(result.toolResults[0].data as any, { pageSize: 25, downloadable: true });
+  return result;
 }
 
 // Builds the live Order-to-Cash pipeline funnel: Open Order Value -> Ready for Delivery ->
@@ -6411,6 +6759,8 @@ async function buildMaterialMasterReport(query: string): Promise<{ text: string;
   }
 
   if (wantsInactiveObsolete) {
+    const full = await buildMaterialStatusReport().catch(() => null);
+    if (full) return full;
     const rows = blockedStatus.slice(0, 50).map((p: any) => ({ product: p.Product, crossPlantStatus: p.CrossPlantStatus, type: p.ProductType || '—', markedForDeletion: (p.IsMarkedForDeletion === true || p.IsMarkedForDeletion === 'true') ? 'Yes' : 'No' }));
     return buildMmReportResult('queryLiveS8HOData',
       `Live S/4HANA API_PRODUCT_SRV/A_Product sampled ${res.length} materials; ${blockedStatus.length} have a non-blank CrossPlantStatus (blocked/inactive flag).`,
@@ -6472,6 +6822,133 @@ async function buildMaterialMasterReport(query: string): Promise<{ text: string;
   );
 }
 
+// Material status of ALL materials: cross-plant status (MARA-MSTAE), plant-specific status (MARC-MMSTA) and deletion
+// flags, with the live status texts (T141T) so "Obsolete"/"Phase-out" are recognised from the system's own descriptions.
+async function buildMaterialStatusReport(): Promise<{ text: string; toolResults: ToolResult[] } | null> {
+  const [total, cross, plant, texts] = await Promise.all([
+    executeReadOnlySelect(`SELECT COUNT(*) AS N FROM MARA`, 1),
+    executeReadOnlySelect(`SELECT MATNR, MSTAE, MSTDE, MTART, LVORM FROM MARA WHERE MSTAE <> '' OR LVORM = 'X'`, 20000),
+    executeReadOnlySelect(`SELECT MATNR, WERKS, MMSTA, MMSTD, LVORM FROM MARC WHERE MMSTA <> '' OR LVORM = 'X'`, 20000),
+    executeReadOnlySelect(`SELECT MMSTA, MTSTB FROM T141T WHERE SPRAS = 'E'`, 500)
+  ]);
+  if ('error' in cross || 'error' in plant) return null;
+  const statusText = new Map<string, string>(('error' in texts ? [] : texts.rows).map((r: any) => [String(r.MMSTA).trim(), String(r.MTSTB).trim()]));
+  const s = (v: any) => String(v ?? '').trim();
+  const mats = [...new Set([...cross.rows.map((r: any) => s(r.MATNR)), ...plant.rows.map((r: any) => s(r.MATNR))])];
+  const desc = new Map<string, string>();
+  const typeOf = new Map<string, string>(cross.rows.map((r: any) => [s(r.MATNR), s(r.MTART)]));
+  for (let i = 0; i < mats.length; i += 100) {
+    const inList = mats.slice(i, i + 100).map(m => `'${m.replace(/'/g, '')}'`).join(', ');
+    const [mk, ma] = await Promise.all([
+      executeReadOnlySelect(`SELECT MATNR, MAKTX FROM MAKT WHERE SPRAS = 'E' AND MATNR IN ( ${inList} )`, 200),
+      executeReadOnlySelect(`SELECT MATNR, MTART FROM MARA WHERE MATNR IN ( ${inList} )`, 200)
+    ]);
+    if (!('error' in mk)) mk.rows.forEach((r: any) => desc.set(s(r.MATNR), s(r.MAKTX)));
+    if (!('error' in ma)) ma.rows.forEach((r: any) => { if (!typeOf.get(s(r.MATNR))) typeOf.set(s(r.MATNR), s(r.MTART)); });
+  }
+  const display = (m: string) => /^0+\d+$/.test(m) ? m.replace(/^0+/, '') : m;
+  const date = (d: string) => /^\d{8}$/.test(d) && d !== '00000000' ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6)}` : '\u2014';
+  const classify = (text: string, deleted: boolean) => /obsolete/i.test(text) ? 'Obsolete' : /phase/i.test(text) ? 'Phase-out' : deleted ? 'Marked for deletion' : 'Other status';
+  const rows = [
+    ...cross.rows.map((r: any) => {
+      const code = s(r.MSTAE); const text = code ? (statusText.get(code) || '') : '';
+      return { material: display(s(r.MATNR)), description: desc.get(s(r.MATNR)) || '\u2014', type: s(r.MTART) || '\u2014', level: 'Cross-plant', status: code ? `${code} ${text}`.trim() : '\u2014', validFrom: date(s(r.MSTDE)), deletionFlag: s(r.LVORM) === 'X' ? 'Yes' : 'No', category: classify(text, s(r.LVORM) === 'X') };
+    }),
+    ...plant.rows.map((r: any) => {
+      const code = s(r.MMSTA); const text = code ? (statusText.get(code) || '') : '';
+      return { material: display(s(r.MATNR)), description: desc.get(s(r.MATNR)) || '\u2014', type: typeOf.get(s(r.MATNR)) || '\u2014', level: `Plant ${s(r.WERKS)}`, status: code ? `${code} ${text}`.trim() : '\u2014', validFrom: date(s(r.MMSTD)), deletionFlag: s(r.LVORM) === 'X' ? 'Yes' : 'No', category: classify(text, s(r.LVORM) === 'X') };
+    })
+  ];
+  const order = ['Obsolete', 'Phase-out', 'Marked for deletion', 'Other status'];
+  rows.sort((a, b) => order.indexOf(a.category) - order.indexOf(b.category) || a.material.localeCompare(b.material));
+  const count = (c: string) => rows.filter(r => r.category === c).length;
+  const byStatus = new Map<string, number>();
+  rows.filter(r => r.status !== '\u2014').forEach(r => byStatus.set(`${r.status} (${r.level === 'Cross-plant' ? 'cross-plant' : 'plant'})`, (byStatus.get(`${r.status} (${r.level === 'Cross-plant' ? 'cross-plant' : 'plant'})`) || 0) + 1));
+  const obsoleteCodes = [...statusText.entries()].filter(([, t]) => /obsolete|phase/i.test(t)).map(([c, t]) => `${c} "${t}"`);
+  const allMaterials = 'error' in total ? 0 : Number(String(total.rows[0]?.N).trim()) || 0;
+  const result = buildMmReportResult('hanaDbIntelligence',
+    `Of ${allMaterials.toLocaleString('en-US')} materials, ${count('Obsolete')} have an Obsolete status and ${count('Phase-out')} a Phase-out status${obsoleteCodes.length ? ` (status codes ${obsoleteCodes.join(', ')})` : ''}; ${rows.filter(r => r.deletionFlag === 'Yes').length} are marked for deletion. All material status assignments: ${[...byStatus.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}: ${v}`).join('; ') || 'none'}.`,
+    'Material Status \u2014 Obsolete, Phase-out and Deletion Flags (all materials)',
+    [
+      { label: 'Materials checked', value: allMaterials.toLocaleString('en-US') },
+      { label: 'Obsolete', value: String(count('Obsolete')) },
+      { label: 'Phase-out', value: String(count('Phase-out')) },
+      { label: 'Marked for deletion', value: String(rows.filter(r => r.deletionFlag === 'Yes').length) },
+      { label: 'Other status', value: String(count('Other status')) }
+    ],
+    [
+      { key: 'material', label: 'Material' }, { key: 'description', label: 'Description' }, { key: 'type', label: 'Type' }, { key: 'level', label: 'Level' },
+      { key: 'status', label: 'Material Status' }, { key: 'validFrom', label: 'Status Valid From' }, { key: 'deletionFlag', label: 'Deletion Flag' }, { key: 'category', label: 'Category' }
+    ],
+    rows,
+    'Read live from the material master for all materials: cross-plant status MARA-MSTAE, plant-specific status MARC-MMSTA, deletion flags MARA/MARC-LVORM, status texts T141T and descriptions MAKT. "Obsolete" and "Phase-out" are taken from the system\u2019s own status descriptions.'
+  );
+  Object.assign(result.toolResults[0].data as any, { pageSize: 25, downloadable: true });
+  return result;
+}
+
+// Stock value of one material: total valuated stock value and price from the material valuation (MBEW), in the company
+// code currency (T001K -> T001, CURR scaled by TCURX), with each stock line valued at that price.
+async function buildMaterialStockValueReport(material: string, plant: string | null, stock: any[]): Promise<{ text: string; toolResults: ToolResult[] } | null> {
+  const matnrs = [material, /^\d+$/.test(material) ? material.padStart(18, '0') : ''].filter(Boolean).map(m => `'${m.replace(/'/g, '')}'`).join(', ');
+  const val = await executeReadOnlySelect(`SELECT MATNR, BWKEY, BWTAR, LBKUM, SALK3, VPRSV, VERPR, STPRS, PEINH FROM MBEW WHERE MATNR IN ( ${matnrs} )${plant ? ` AND BWKEY = '${plant.replace(/'/g, '')}'` : ''}`, 500);
+  if ('error' in val) return null;
+  const plants = [...new Set(val.rows.map((r: any) => String(r.BWKEY).trim()))];
+  const cur = plants.length ? await executeReadOnlySelect(`SELECT k~BWKEY, t~WAERS FROM T001K AS k INNER JOIN T001 AS t ON t~BUKRS = k~BUKRS WHERE k~BWKEY IN ( ${plants.map(p => `'${p}'`).join(', ')} )`, 100) : { rows: [] as any[] };
+  const currencyOf = new Map<string, string>(('error' in cur ? [] : cur.rows).map((r: any) => [String(r.BWKEY).trim(), String(r.WAERS).trim()]));
+  const currencies = [...new Set(currencyOf.values())];
+  const dec = currencies.length ? await executeReadOnlySelect(`SELECT CURRKEY, CURRDEC FROM TCURX WHERE CURRKEY IN ( ${currencies.map(c => `'${c}'`).join(', ')} )`, 50) : { rows: [] as any[] };
+  const decimals = new Map<string, number>(('error' in dec ? [] : dec.rows).map((r: any) => [String(r.CURRKEY).trim(), Number(String(r.CURRDEC).trim())]));
+  const scale = (amount: number, currency: string) => amount * Math.pow(10, 2 - (decimals.has(currency) ? decimals.get(currency)! : 2));
+  const money = (v: number, c: string) => `${v.toLocaleString('en-US', { minimumFractionDigits: decimals.get(c) ?? 2, maximumFractionDigits: decimals.get(c) ?? 2 })} ${c}`;
+  const valuation = val.rows.map((r: any) => {
+    const bwkey = String(r.BWKEY).trim();
+    const currency = currencyOf.get(bwkey) || '';
+    const peinh = Number(String(r.PEINH).trim()) || 1;
+    const control = String(r.VPRSV).trim();
+    const price = scale(Number(String(control === 'S' ? r.STPRS : r.VERPR).trim()) || 0, currency);
+    return { plant: bwkey, valuationType: String(r.BWTAR || '').trim(), qty: Number(String(r.LBKUM).trim()) || 0, value: scale(Number(String(r.SALK3).trim()) || 0, currency), currency, control, price, peinh };
+  });
+  if (!valuation.length) {
+    return buildMmReportResult('queryLiveS8HOData',
+      `Material ${material} has no valuation record${plant ? ` for plant ${plant}` : ''} in the live S/4HANA material valuation (MBEW), so no stock value can be stated.`,
+      `Stock Value \u2014 Material ${material}${plant ? `, Plant ${plant}` : ''}`, [{ label: 'Valuation records', value: '0' }], [{ key: 'material', label: 'Material' }], [],
+      'Live material valuation (MBEW) returned no record for this material/plant.');
+  }
+  const unit = stock.find((s: any) => s.MaterialBaseUnit)?.MaterialBaseUnit || '';
+  const rows = stock.map((s: any) => {
+    const v = valuation.find(x => x.plant === String(s.Plant).trim());
+    const qty = Number(s.MatlWrhsStkQtyInMatlBaseUnit) || 0;
+    const stockType = String(s.InventoryStockType || '').trim();
+    return {
+      material: s.Material, plant: s.Plant || '\u2014', storageLocation: s.StorageLocation || '\u2014', batch: s.Batch || '\u2014',
+      stockType: stockType === '01' ? 'Unrestricted' : stockType === '02' ? 'Quality inspection' : stockType === '03' ? 'Blocked' : (stockType || '\u2014'),
+      quantity: qty, unit: s.MaterialBaseUnit || '\u2014',
+      unitPrice: v ? money(v.price / v.peinh, v.currency) : '\u2014',
+      value: v ? money(qty * v.price / v.peinh, v.currency) : '\u2014'
+    };
+  });
+  const totals = new Map<string, number>();
+  valuation.forEach(v => totals.set(v.currency, (totals.get(v.currency) || 0) + v.value));
+  const totalText = [...totals.entries()].map(([c, v]) => money(v, c)).join(' + ');
+  const lines = valuation.map(v => `plant ${v.plant}${v.valuationType ? ` (valuation type ${v.valuationType})` : ''}: ${v.qty.toLocaleString('en-US')} ${unit} valued at ${money(v.value, v.currency)} (${v.control === 'S' ? 'standard price' : 'moving average price'} ${money(v.price, v.currency)} per ${v.peinh} ${unit})`);
+  return buildMmReportResult('queryLiveS8HOData',
+    `Stock value of material ${material}${plant ? ` in plant ${plant}` : ''}: **${totalText}**. ${lines.join('; ')}.`,
+    `Stock Value \u2014 Material ${material}${plant ? `, Plant ${plant}` : ''}`,
+    [
+      { label: 'Total stock value', value: totalText },
+      { label: 'Valuated stock', value: `${valuation.reduce((a, v) => a + v.qty, 0).toLocaleString('en-US')} ${unit}`.trim() },
+      ...(valuation.length === 1 ? [{ label: valuation[0].control === 'S' ? 'Standard price' : 'Moving average price', value: `${money(valuation[0].price, valuation[0].currency)} / ${valuation[0].peinh} ${unit}`.trim() }] : [])
+    ],
+    [
+      { key: 'material', label: 'Material' }, { key: 'plant', label: 'Plant' }, { key: 'storageLocation', label: 'Storage Loc.' }, { key: 'batch', label: 'Batch' },
+      { key: 'stockType', label: 'Stock Type' }, { key: 'quantity', label: 'Quantity' }, { key: 'unit', label: 'Unit' }, { key: 'unitPrice', label: 'Unit Price' }, { key: 'value', label: 'Stock Value' }
+    ],
+    rows,
+    'Total stock value and price read live from the material valuation (MBEW: valuated stock, total value, price control, standard/moving average price, price unit) in the company code currency (T001K/T001); stock lines from API_MATERIAL_STOCK_SRV, each valued at that price.'
+  );
+}
+
 // Live S/4HANA Material Stock report via API_MATERIAL_STOCK_SRV/A_MatlStkInAcctMod. Real stock-type
 // codes confirmed live in this landscape: '01'=Unrestricted-use, '02'=Quality Inspection,
 // '03'=Blocked (standard SAP MM domain values) — used for blocked/QI-stock filtering below.
@@ -6490,6 +6967,11 @@ async function buildMaterialStockReport(query: string): Promise<{ text: string; 
   const negativeStock = res.filter((r: any) => Number(r.MatlWrhsStkQtyInMatlBaseUnit) < 0);
   const blockedStock = res.filter((r: any) => String(r.InventoryStockType).trim() === '03');
   const qiStock = res.filter((r: any) => String(r.InventoryStockType).trim() === '02');
+
+  if (materialMatch && /\b(value|valuation|amount|worth)\b/.test(q)) {
+    const valueReport = await buildMaterialStockValueReport(materialMatch[1].trim(), plantMatch ? plantMatch[1].trim() : null, res);
+    if (valueReport) return valueReport;
+  }
 
   const wantsByPlant = (q.includes('by plant') || q.includes('across all plants') || q.includes('current inventory')) && !materialMatch;
   const wantsShortageOnly = q.includes('out of stock') || q.includes('zero stock') || q.includes('shortage') || q.includes('no stock');
@@ -8478,7 +8960,7 @@ async function buildEwmOutboundCapacityForecast(): Promise<{ text: string; toolR
 // Analytics/Visualization shaping -> Report. If the live HANA connection cannot be reached (see
 // hanaDbIntelligenceService.ts header comment for the verified network-reachability finding), the
 // REAL connection error is returned honestly — never a mock/simulated result.
-async function buildHanaDbIntelligenceReport(userQuestion: string, onAgentUpdate?: (agent: string, action: string) => void): Promise<{ text: string; toolResults: ToolResult[] }> {
+async function buildHanaDbIntelligenceReport(userQuestion: string, onAgentUpdate?: (agent: string, action: string) => void, reportOpts?: { maxRows: number; reportTitle: string }): Promise<{ text: string; toolResults: ToolResult[] }> {
   const connInfo = getHanaConnectionInfo();
   const timestamp = new Date().toISOString();
   if (!connInfo) {
@@ -8798,7 +9280,7 @@ async function buildHanaDbIntelligenceReport(userQuestion: string, onAgentUpdate
   const runPlanned = async (sql: string): Promise<{ rows: any[]; rowCount: number; sql: string; totalRows: number } | { error: string; sql: string }> => {
     const results = [];
     for (const part of splitUnion(sql)) {
-      const r = await executeReadOnlySelect(part);
+      const r = await executeReadOnlySelect(part, reportOpts?.maxRows);
       if ('error' in r) return r;
       results.push(r);
     }
@@ -8865,7 +9347,13 @@ async function buildHanaDbIntelligenceReport(userQuestion: string, onAgentUpdate
   onAgentUpdate?.(AGENTS.HANA_ANALYTICS_KPI_AGENT.name, `Live query returned ${execResult.rowCount} real row(s) (${execResult.totalRows} total matching) — deriving KPIs/visualization shape...`);
   const rows = execResult.rows;
   const columnKeys = rows.length ? Object.keys(rows[0]) : [];
-  const columns = columnKeys.map(k => ({ key: k, label: k }));
+  const fieldLabels = new Map<string, string>();
+  if (reportOpts && columnKeys.length) {
+    const tabs = referencedTablesOf(execResult.sql);
+    const lbl = tabs.length ? await executeReadOnlySelect(`SELECT FIELDNAME, SCRTEXT_M FROM DD03M WHERE DDLANGUAGE = 'E' AND TABNAME IN ( ${tabs.map(t => `'${t}'`).join(', ')} ) AND FIELDNAME IN ( ${columnKeys.map(k => `'${k.toUpperCase().replace(/'/g, '')}'`).join(', ')} )`, 500) : null;
+    if (lbl && !('error' in lbl)) lbl.rows.forEach((r: any) => { const t = String(r.SCRTEXT_M || '').trim(); if (t) fieldLabels.set(String(r.FIELDNAME).trim(), t); });
+  }
+  const columns = columnKeys.map(k => ({ key: k, label: fieldLabels.get(k.toUpperCase()) || k }));
   const isKpiShape = rows.length === 1 && columnKeys.length <= 3;
   const numericKey = columnKeys.find(k => rows.length > 0 && !isNaN(Number(rows[0][k])) && rows[0][k] !== '');
   const categoryKey = columnKeys.find(k => k !== numericKey);
@@ -8895,7 +9383,7 @@ async function buildHanaDbIntelligenceReport(userQuestion: string, onAgentUpdate
       toolName: 'hanaDbIntelligence',
       agentName: AGENTS.HANA_REPORT_AGENT.name,
       data: {
-        reportTitle: 'HANA DB Intelligence — Live Query Result',
+        reportTitle: reportOpts?.reportTitle || 'HANA DB Intelligence — Live Query Result',
         question: userQuestion,
         sourceSystem: `${connInfo.systemId} (Client ${connInfo.client}) — Live SAP HANA Database via ${connInfo.accessMethod}`,
         host: connInfo.host,
@@ -8904,7 +9392,7 @@ async function buildHanaDbIntelligenceReport(userQuestion: string, onAgentUpdate
         rowCount: execResult.rowCount,
         totalRows: execResult.totalRows,
         columns,
-        rows: rows.slice(0, 200),
+        rows: reportOpts ? rows : rows.slice(0, 200),
         kpi: isKpiShape && numericKey ? { label: numericKey, value: rows[0][numericKey] } : null,
         chart: chartData ? { categoryKey: 'name', measureKey: 'value', data: chartData } : null,
         note: 'Every row above was returned live, at request time, directly from the connected SAP HANA database via a validated read-only SELECT — no mock, cached, or fabricated data.'
@@ -10469,10 +10957,219 @@ function abapSectionToolResult(s: AbapSection): ToolResult {
   return { type: 'mm_live_report', toolName: 'abapLiveData', agentName: AGENTS.ABAP_LIVE_AGENT.name, data: { reportTitle: s.title, summaryStats: s.summaryStats || [], columns: s.columns, rows: s.rows, note: s.note || '' } } as ToolResult;
 }
 
+// Flowchart (start/end, input/output, process, decision, database, document, call) derived from the real ABAP source.
+async function generateAbapFlowPlan(facts: AbapSpecFacts, narrative: AbapSpecNarrative | null): Promise<FlowPlan | null> {
+  try {
+    const resp = await generateContentWithFallback({
+      model: 'gemini-3.1-flash-lite',
+      contents: [{ role: 'user', parts: [{ text: `Program ${facts.name} (${facts.kind}).\nSelection screen: ${facts.selection.map(s => s.name).join(', ') || 'none'}\nTables read: ${[...new Set(facts.selects.flatMap(s => s.tables))].join(', ') || 'none'}\nTables updated: ${[...new Set(facts.writes.map(w => w.table))].join(', ') || 'none'}\nFunction modules: ${facts.functions.map(x => x.name).join(', ') || 'none'}\nTechnical flow: ${JSON.stringify(narrative?.technicalFlow || [])}\n\nReal ABAP source:\n${facts.source.slice(0, 40000)}` }] }],
+      config: {
+        responseMimeType: 'application/json',
+        systemInstruction: 'You draw a process flowchart of an existing ABAP program from its REAL source code only. Return JSON {"nodes": [...]} in execution order. Node: {"id": short id, "type": one of start|end|io|process|decision|database|document|subprocess, "label": max 45 characters}. Use: start first and end last; io for the selection screen and screen/list output or messages; database for real table reads/updates (name the real tables); subprocess for real function modules/BAPIs/PERFORM routines/CALL TRANSACTION/SUBMIT; document for a printed list/report/ALV output; decision ONLY for real IF/CASE/CHECK/sy-subrc/IS INITIAL conditions in the source, phrased as a short question. A decision continues on its "yes" path to the next node, so phrase it so that Yes is the normal processing (e.g. "Billing documents found?"); the exceptional path (no data, error, skip) goes under "no". Add "yesLabel", "noLabel" and "no": {"steps": [0-3 nodes of type io|process|database|document|subprocess], "then": "end" (program stops) | "continue" (rejoin the next node) | id of another node (e.g. loop back to the loop start, or jump past the loop)}. For a LOOP use a decision such as "More entries?" whose no-path jumps to the node after the loop. Exactly one start node (first) and one end node (last); never put start, end or "exit" steps in the middle of the main path. 8 to 16 nodes in total, at most 4 decisions. Never invent tables, routines, function modules or conditions that are not in the source.'
+      }
+    });
+    const raw = (resp.text || '').trim();
+    return sanitizeFlowPlan(JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1)), facts);
+  } catch (e: any) {
+    console.error('[ABAP FLOW PLAN ERROR]', e?.message || e);
+    return null;
+  }
+}
+
+// Adds the "Fit-to-Standard & S/4HANA Modernization Recommendations" section to an ABAP specification document.
+// The existing document is kept byte-for-byte; on any failure it is returned unchanged.
+async function addAbapModernizationRecommendations(
+  query: string, facts: AbapSpecFacts, narrative: AbapSpecNarrative | null, verified: Record<string, string>[], html: string,
+  onAgentUpdate?: (agent: string, action: string) => void
+): Promise<{ html: string; summary: string }> {
+  try {
+    onAgentUpdate?.(AGENTS.ABAP_LIVE_AGENT.name, 'Checking API release states, custom dependencies and usage indicators for Fit-to-Standard and Clean Core...');
+    const evidence = await collectModernizationEvidence(facts, verified);
+    let plan: ModernizationPlan | null = null;
+    try {
+      onAgentUpdate?.(AGENTS.ABAP_LIVE_AGENT.name, 'Deriving Fit-to-Standard, Clean Core, BTP, in-app extension, refactor and retirement recommendations from the evidence...');
+      const resp = await generateContentWithFallback({
+        model: 'gemini-3.1-flash-lite',
+        contents: [{ role: 'user', parts: [{ text: `User request: "${query}"\n\nExisting functional narrative (JSON):\n${JSON.stringify(narrative || {}).slice(0, 8000)}\n\nVerified live evidence (JSON):\n${JSON.stringify(evidence).slice(0, 20000)}\n\nReal ABAP source read live:\n${facts.source.slice(0, 30000)}` }] }],
+        config: {
+          responseMimeType: 'application/json',
+          maxOutputTokens: 8192,
+          systemInstruction: `You are a senior SAP S/4HANA clean-core architect. Write modernization recommendations for this existing custom ABAP program in exactly this priority order: ${MODERNIZATION_AREAS.map((a, i) => `(${i + 1}) ${a}`).join(', ')}. ` +
+            'Fit-to-Standard: does equivalent S/4HANA standard functionality (Fiori app, standard API, CDS view, RAP business object, workflow, BAdI, configuration or standard report) exist; recommend replacing custom code where appropriate. ' +
+            'Clean Core: modifications, obsolete/deprecated objects, direct table access, unreleased APIs (use the API release states given), custom Z/Y objects and S/4HANA incompatibilities, with SAP-supported alternatives (use the successors given). ' +
+            'BTP Extension: where standard cannot satisfy the need, evaluate side-by-side extensibility (CAP/RAP, Integration Suite, Event Mesh, Build Process Automation, APIs). ' +
+            'S/4HANA In-App Extension: Key User Extensibility, Custom Fields and Logic, released BAdIs/APIs, CDS and RAP extensions before traditional custom ABAP. ' +
+            'Refactor / Retain: if custom ABAP is genuinely required, modernise with released APIs, ABAP Cloud, CDS/RAP, performance, security and testability. ' +
+            'Retirement: recommend only when the evidence supports it (duplicates, replaced by standard, no transaction/job/variant usage); execution frequency is not monitored in this system, so retirement based on non-use must be marked To Be Validated. ' +
+            'RULES: Use ONLY the evidence and source provided. verifiedFindings may only state facts present in the evidence or source. Never invent SAP functionality, APIs, Fiori app IDs, tables, usage statistics or migration findings; anything you cannot confirm from the evidence goes into toBeValidated and must be worded "To Be Validated". Name standard objects only with exact technical names you are confident exist in S/4HANA; list each in namedObjects so it can be verified live. ' +
+            'Return JSON: {"summary": string (3-5 sentences), "recommendations": [{"priority": 1-6, "area": one of the six area names, "applicable": "Yes"|"No"|"To Be Validated", "verdict": string, "currentCustomSolution": string, "businessRequirement": string, "s4StandardAlternative": string, "fitGap": string, "btpInAppAlternative": string, "recommendedTargetArchitecture": string, "migrationComplexity": "Low"|"Medium"|"High"|"To Be Validated", "dependencies": string, "businessBenefit": string, "risk": string, "requiredActions": string[], "verifiedFindings": string[], "toBeValidated": string[]}] (exactly six, one per area), "namedObjects": [{"type": one of TCODE|BAPI|FM|CDS|CLASS|TABLE|FIORI_APP|BTP_SERVICE, "name": exact name}]}.'
+        }
+      });
+      const raw = (resp.text || '').trim();
+      plan = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1));
+    } catch (e: any) {
+      console.error('[ABAP MODERNIZATION NARRATIVE ERROR]', e?.message || e);
+    }
+    const named = (plan?.namedObjects || []).filter(o => o?.name && o?.type).slice(0, 30);
+    const [checked, release] = await Promise.all([
+      verifyStandardCandidates(named),
+      apiReleaseStates(named.filter(o => !['FIORI_APP', 'BTP_SERVICE'].includes(o.type)).map(o => ({ name: o.name, type: o.type })))
+    ]);
+    const objectChecks = checked.map(c => ({
+      ...c,
+      exists: c.exists === 'Not checkable in DB' ? 'To Be Validated' : c.exists,
+      releaseState: ['FIORI_APP', 'BTP_SERVICE'].includes(c.type) ? 'To Be Validated' : c.type === 'TCODE' ? '' : release.get(c.name)?.releaseState || ''
+    }));
+    const section = renderModernizationSection(evidence, plan, objectChecks);
+    const recs = (plan?.recommendations || []).slice().sort((a, b) => (a.priority || 9) - (b.priority || 9));
+    const summary = plan
+      ? `${plan.summary || ''}${recs.length ? ` Priority view: ${recs.map(r => `${r.area} – ${r.applicable}`).join('; ')}.` : ''}`.trim()
+      : 'Verified live evidence (API release states, custom dependencies, code findings, usage indicators) was added; the recommendation narrative could not be generated.';
+    return { html: insertModernizationSection(html, section), summary };
+  } catch (e: any) {
+    console.error('[ABAP MODERNIZATION SECTION ERROR]', e?.message || e);
+    return { html, summary: '' };
+  }
+}
+
 // Adds a live repository check (tables, fields, classes, function modules) of an AI code proposal.
 async function withLiveAbapCodeCheck(report: { text: string; toolResults: ToolResult[] }): Promise<{ text: string; toolResults: ToolResult[] }> {
   const check = await validateGeneratedAbapCode(report.text).catch(() => null);
   return check ? { ...report, toolResults: [...report.toolResults, abapSectionToolResult(check)] } : report;
+}
+
+// ABAP source pasted into the question (at least a few real ABAP statements on separate lines).
+function extractPastedAbapCode(query: string): string | null {
+  const lines = query.split(/\r?\n/);
+  const abapLines = lines.filter(l => /^\s*(REPORT|PROGRAM|TABLES|TYPES|DATA|CONSTANTS|PARAMETERS|SELECT-OPTIONS|SELECTION-SCREEN|START-OF-SELECTION|END-OF-SELECTION|INITIALIZATION|AT SELECTION-SCREEN|FORM|ENDFORM|PERFORM|SELECT|ENDSELECT|LOOP|ENDLOOP|IF|ENDIF|ELSE|CASE|ENDCASE|CALL FUNCTION|CALL METHOD|METHOD|ENDMETHOD|CLASS|ENDCLASS|MODULE|ENDMODULE|APPEND|MODIFY|READ TABLE|WRITE|MESSAGE|DEFINE|END-OF-DEFINITION)\b/i.test(l));
+  if (abapLines.length < 4) return null;
+  const start = lines.findIndex(l => abapLines.includes(l));
+  return lines.slice(Math.max(0, start)).join('\n').trim();
+}
+
+// Explains ABAP source pasted by the user, grounded in a live check of every table, field and function it uses.
+async function buildPastedAbapExplanation(query: string, code: string, backendTarget: SapBackendTarget): Promise<{ text: string; toolResults: ToolResult[] } | null> {
+  const fenced = `\`\`\`abap\n${code}\n\`\`\``;
+  const check = backendTarget !== 'ECC' ? await validateGeneratedAbapCode(fenced).catch(() => null) : null;
+  const facts: string[] = [];
+  if (check) {
+    const tables = check.rows.filter(r => /Table|view/i.test(r.kind) && r.exists === 'Yes').map(r => r.object).slice(0, 10);
+    const counts = await Promise.all(tables.map(t => executeReadOnlySelect(`SELECT COUNT( * ) AS N FROM ${t}`, 1).then(r => 'error' in r ? null : { t, n: Number(String(r.rows[0]?.N || '0').trim()) }).catch(() => null)));
+    check.rows.forEach(r => facts.push(`${r.object} (${r.kind}): ${r.exists === 'Yes' ? 'exists' : 'NOT found'} in the connected S/4HANA system${r.detail ? ` \u2014 ${r.detail}` : ''}`));
+    counts.filter(Boolean).forEach(c => facts.push(`Table ${c!.t} currently holds ${c!.n} row(s) in the connected system`));
+  }
+  try {
+    const response = await generateContentWithFallback({
+      model: 'gemini-3.1-flash-lite',
+      contents: [{ role: 'user', parts: [{ text: `${query.replace(code, '').trim() || 'What does this code do?'}\n\nABAP source:\n${fenced}${facts.length ? `\n\nLive facts from the connected SAP S/4HANA system:\n- ${facts.join('\n- ')}` : ''}` }] }],
+      config: {
+        systemInstruction: 'You are a Senior SAP ABAP Developer with 30+ years of experience. In a professional, neutral tone (no persona chatter), explain what the given ABAP program does: (1) a 2-3 sentence business summary, (2) the selection screen inputs, (3) the processing steps in order (data selection with tables and join conditions, checks, output), (4) the output (fields and how it is displayed), (5) issues and modernization advice as a senior reviewer \u2014 e.g. obsolete tables in S/4HANA, missing fields in the field catalog, missing authority checks, performance, classic ALV vs SALV/CDS, Clean Core. Use the live facts when given: if a table holds 0 rows or is an S/4HANA simplification item, say so and explain the consequence for this program in the connected system, and name the replacement. Use only names that appear in the code or the live facts. Use short markdown headings and bullets.'
+      }
+    });
+    const text = (response.text || '').trim();
+    if (!text) return null;
+    return { text, toolResults: check ? [abapSectionToolResult({ ...check, title: 'Live Repository Check of the Pasted Code' })] : [] };
+  } catch { return null; }
+}
+
+// Solution-architecture / BTP-CAP design requests: a full design with code artifacts, grounded in the live sales order API.
+function isSolutionDesignRequest(query: string): boolean {
+  const n = query.toLowerCase();
+  return query.length > 150
+    && /\b(cap|cloud application programming|btp|business technology platform|fiori elements|annotations\.cds|schema\.cds|service\.cds|xsuaa|sap build apps?)\b/.test(n)
+    && /\b(design|build|generate|implementation guide|code snippets?|architect|step-by-step|artifacts?)\b/.test(n);
+}
+
+async function buildSolutionDesignAnswer(query: string, backendTarget: SapBackendTarget, onAgentUpdate?: (agent: string, action: string) => void): Promise<{ text: string; toolResults: ToolResult[] } | null> {
+  const grounding: string[] = [];
+  const toolResults: ToolResult[] = [];
+  if (backendTarget !== 'ECC' && /sales order|held|hold|block/i.test(query)) {
+    onAgentUpdate?.('Solution Architect Agent', 'Checking the live S/4HANA sales order API and current hold volumes to ground the design...');
+    const countOf = (where: string) => executeReadOnlySelect(`SELECT COUNT( * ) AS N FROM VBAK${where ? ` WHERE ${where}` : ''}`, 1).then(r => 'error' in r ? null : String(r.rows[0]?.N ?? '0').trim()).catch(() => null);
+    const [meta, all, dlv, bil, crd] = await Promise.all([
+      fetchBwMetadataXml('API_SALES_ORDER_SRV').catch(() => null),
+      countOf(''), countOf(`LIFSK <> ' '`), countOf(`FAKSK <> ' '`), countOf(`CMGST = 'B'`)
+    ]);
+    const fields = ['DeliveryBlockReason', 'HeaderBillingBlockReason', 'TotalCreditCheckStatus', 'OverallSDProcessStatus', 'TotalNetAmount', 'TransactionCurrency', 'SalesOrganization', 'SoldToParty', 'CreationDate'];
+    if (meta) {
+      const present = fields.filter(f => new RegExp(`Name="${f}"`).test(meta));
+      grounding.push(`API_SALES_ORDER_SRV is active in the connected S/4HANA system; entity A_SalesOrder exposes: ${present.join(', ')}${present.length < fields.length ? `; not exposed: ${fields.filter(f => !present.includes(f)).join(', ')}` : ''}. Updating DeliveryBlockReason / HeaderBillingBlockReason via PATCH with an If-Match ETag is supported.`);
+      toolResults.push({ type: 'mm_live_report', toolName: 'solutionDesignGrounding', agentName: 'Solution Architect Agent', data: { reportTitle: 'Live S/4HANA Integration Check for the Design', summaryStats: [], columns: [{ key: 'item', label: 'Item' }, { key: 'value', label: 'Live Result' }], rows: [{ item: 'API_SALES_ORDER_SRV / A_SalesOrder', value: 'Active' }, ...fields.map(f => ({ item: `Field ${f}`, value: present.includes(f) ? 'Available' : 'Not exposed' }))], note: 'Checked live against the connected system\'s API_SALES_ORDER_SRV $metadata so the CAP integration code uses real field names; hold counts from the sales order header table.' } } as ToolResult);
+    }
+    if (all !== null) {
+      grounding.push(`Current live sales orders: ${all} total, ${dlv ?? 'n/a'} with a delivery block, ${bil ?? 'n/a'} with a billing block, ${crd ?? 'n/a'} credit-blocked (VBAK).`);
+      (toolResults[0]?.data?.rows as any[] | undefined)?.push({ item: 'Orders with delivery block', value: dlv ?? 'n/a' }, { item: 'Orders with billing block', value: bil ?? 'n/a' }, { item: 'Credit-blocked orders', value: crd ?? 'n/a' });
+    }
+  }
+  try {
+    onAgentUpdate?.('Solution Architect Agent', 'Generating the implementation guide and code artifacts...');
+    const response = await generateContentWithFallback({
+      model: 'gemini-3.1-flash-lite',
+      contents: [{ role: 'user', parts: [{ text: `${query}${grounding.length ? `\n\nLive facts from the connected SAP S/4HANA system (use these exact API/field names in the integration code):\n- ${grounding.join('\n- ')}` : ''}` }] }],
+      config: {
+        maxOutputTokens: 16384,
+        systemInstruction: 'You are a Senior SAP Solutions Architect and SAP BTP / CAP developer. Deliver exactly the artifacts requested, complete and production-grade: a numbered step-by-step implementation guide, then each file in its own fenced code block titled with its path (e.g. db/schema.cds, srv/cat-service.cds, srv/cat-service.js, app/annotations.cds, xs-security.json, mta.yaml snippets), using current CAP (cds 8+, Node.js, cds.ql, cds.connect.to for the S/4HANA OData service via a BTP destination with If-Match ETag handling), Fiori elements annotations (UI.LineItem with Criticality, UI.HeaderInfo, UI.SelectionFields, UI.DataPoint/KPIs, UI.Facets, process flow and audit timeline facets), and XSUAA role collections. Where live facts are given, use those exact API and field names. Keep explanations brief between artifacts. Start with a one-line note that the code is a generated proposal to review before deployment.'
+      }
+    });
+    const text = (response.text || '').trim();
+    if (!text) return null;
+    return { text, toolResults };
+  } catch { return null; }
+}
+
+// SAP knowledge / support questions (processes, concepts, configuration, T-codes, tables) that must be answered
+// from SAP know-how, never from the live business data. Any sign of a live-data request keeps the existing routing.
+function isSapKnowledgeHubQuestion(query: string): boolean {
+  const q = query.trim();
+  const n = q.toLowerCase();
+  if (q.length < 12 || /^hana db intelligence/.test(n)) return false;
+  const knowledge =
+    /\bwalk (me |us )?through\b/.test(n)
+    || /\bexplain (how|what|the|in detail|briefly|about|sap|difference|concept|purpose|role|meaning|significance|process|flow|cycle|configuration|customi[sz]ing|step)\b/.test(n)
+    || /\bexplain\b.{0,80}\b(configuration|customi[sz]ing|strategy|determination|procedure|concept|cycle|integration|architecture|schema|master data|document types?|item categor(y|ies)|condition types?|movement types?|posting keys?|copy control|output determination|partner determination|pricing procedure)\b/.test(n)
+    || /\bhow (is|are) .{1,80}\b(determined|calculated|derived|configured|set up|maintained|assigned|triggered|integrated|controlled|proposed|copied)\b/.test(n)
+    || /\bhow does .{1,80}\bwork\b/.test(n)
+    || /\bdifferences? between\b/.test(n)
+    || /\bwhat (is|are) (the )?(purpose|use|role|meaning|significance|concept|function|importance) of\b|\bwhat is meant by\b|\bwhat (is|are) (an? |the )?[a-z][a-z /-]{2,60} in sap\b/.test(n)
+    || /\b(key |main |important )?(configuration|customi[sz]ing|config|spro|img) (steps?|settings?|paths?|nodes?|activities)\b|\bhow (to|do i|do you|can i) (configure|customi[sz]e)\b/.test(n)
+    || /\b(t-?codes?|transaction codes?)\b.{0,60}\btables?\b|\btables? (involved|used)\b|\b(which|what|key|important|main) (sap )?(tables|t-?codes|transaction codes)\b/.test(n)
+    || /\b(end[- ]to[- ]end|complete|full|entire)\b.{0,40}\b(cycle|process|flow|lifecycle)\b/.test(n)
+    || /\b(o2c|otc|order[- ]to[- ]cash|p2p|ptp|procure[- ]to[- ]pay|r2r|record[- ]to[- ]report|plan[- ]to[- ]produce|hire[- ]to[- ]retire|quote[- ]to[- ]cash)\b.{0,30}\b(cycle|process|flow)\b/.test(n)
+    || /\bbest practices?\b|\binterview questions?\b|\boverview of\b|\bintroduction to\b|\bbasics of\b|\bconcept of\b/.test(n);
+  if (!knowledge) return false;
+  const liveSignal =
+    /\b(my|our|we)\b/.test(n)
+    || /\b(this|these)\b/.test(n)
+    || /\b(today'?s?|yesterday|tomorrow|currently|current|right now|real[- ]?time|live|last (week|month|quarter|year)|next (week|month|quarter|year)|this (week|month|quarter|year))\b/.test(n)
+    || /\bwhy (is|are|did|does|do|was|were|has|have|hasn'?t|haven'?t|isn'?t|aren'?t|can'?t|cannot|won'?t)\b|\bexplain why\b|\broot cause\b/.test(n)
+    || /\b(pull|fetch|retrieve|extract|download|generate|create|write|build|update|delete|cancel|approve|execute|simulate|count|how many|how much|status of)\b/.test(n)
+    || /\bin (the|our|my) (connected |live )?system\b/.test(n)
+    || /\b\d{4,}\b/.test(n)
+    || /\b(customer|vendor|supplier|material|plant|order|document|user|employee|invoice|delivery|lot|batch|po|warehouse|company code)\s+[a-z0-9_-]*\d/.test(n)
+    || /\b[ZY][A-Z0-9_]{2,}\b/.test(q);
+  return !liveSignal;
+}
+
+async function buildSapKnowledgeHubAnswer(query: string, userRole: UserRole, backendTarget: SapBackendTarget, history: Message[]): Promise<{ text: string; toolResults: ToolResult[] }> {
+  const system = backendTarget === 'ECC' ? 'SAP ECC 6.0' : backendTarget === 'S/4HANA' ? 'SAP S/4HANA' : 'SAP ECC and SAP S/4HANA';
+  const recent = history.slice(-4).map((m: any) => `${m?.role === 'user' ? 'User' : 'Assistant'}: ${String(m?.content || '').slice(0, 1200)}`).join('\n');
+  const systemInstruction = `You are the SAP Knowledge Hub Agent: a senior SAP solution consultant and support expert answering for a ${userRole}. The user asks an SAP knowledge or support question (process, concept, configuration, determination logic, T-codes, tables, integration, troubleshooting approach). Answer from SAP standard product knowledge only; this answer does not read the user's SAP system.
+Focus on ${system}; when ECC and S/4HANA differ (e.g. VBUK/VBUP status fields moved into VBAK/VBAP, BSEG/BSID/BSIK/BSAD/BSAK as compatibility views over ACDOCA, MKPF/MSEG replaced by MATDOC, KNA1/LFA1 via Business Partner/CVI, Fiori apps), state the difference.
+Structure: a short overview; then the process or logic as numbered steps; then markdown tables where relevant: | Step | T-code (ECC) | Fiori app / S/4HANA | Key tables | and | Configuration activity | SPRO path / T-code |; then integration points, common issues and how to check them, and practical tips.
+Use exact standard SAP names for T-codes, tables, fields, SPRO paths, condition types, item categories and document types. Never invent document numbers, customer/vendor/material numbers, quantities, amounts or user IDs, and never claim to have looked anything up in the user's system. End with one line noting that company-specific configuration may differ from SAP standard. Use bold headings. Do not mention servers, hosts, IPs or APIs.`;
+  const prompt = `${recent ? `Conversation so far (for context only):\n${recent}\n\n` : ''}Question: ${query}`;
+  let lastErr = '';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const resp = await generateContentWithFallback({ model: 'gemini-3.1-flash-lite', contents: [{ role: 'user', parts: [{ text: prompt }] }], config: { systemInstruction, maxOutputTokens: 8192 } });
+      const text = (resp.text || '').trim();
+      if (text) return { text, toolResults: [{ type: 'sap_knowledge_hub', toolName: 'sapKnowledgeHub', agentName: 'SAP Knowledge Hub Agent', data: { reportTitle: 'SAP Knowledge Hub Agent' } } as ToolResult] };
+      lastErr = 'the AI service returned an empty answer';
+    } catch (e: any) {
+      lastErr = e?.message || String(e);
+    }
+  }
+  return { text: `The SAP Knowledge Hub could not compose an answer right now (${lastErr}). Please ask again in a moment. No live SAP data was read for this knowledge question.`, toolResults: [] };
 }
 
 // Finds the most recent ABAP fenced code block the AI itself generated earlier in this
@@ -11854,15 +12551,16 @@ async function buildHrBusinessPartnerReport(query: string): Promise<{ text: stri
 // working, 3 real company codes in this landscape), used here for HR organizational/financial
 // context (e.g. which company code an employee belongs to).
 async function buildHrCompanyCodeReport(query: string): Promise<{ text: string; toolResults: ToolResult[] } | null> {
-  const ccMatch = query.match(/\bcompany\s*code\s*[:#]?\s*(\w{1,4})\b/i);
-  const filter = ccMatch ? `$filter=CompanyCode eq '${ccMatch[1].trim()}'` : '$top=50';
+  // A filter value must look like a real code (4 chars incl. a digit), so "company codes"/"company code list" lists all.
+  const ccMatch = query.match(/\bcompany\s*code\b\s*[:#]?\s*((?=[A-Za-z]*\d)[A-Za-z0-9]{4})\b/i);
+  const filter = ccMatch ? `$filter=CompanyCode eq '${ccMatch[1].trim()}'` : '$top=5000';
   const res = await sapApi.queryS8HOData('API_COMPANYCODE_SRV', 'A_CompanyCode', filter);
   if (res?.error || !Array.isArray(res)) return null;
   const rows = res.map((c: any) => ({
     companyCode: c.CompanyCode, name: c.CompanyCodeName || '\u2014', city: c.CityName || '\u2014', country: c.Country || '\u2014',
     currency: c.Currency || '\u2014', chartOfAccounts: c.ChartOfAccounts || '\u2014', fiscalYearVariant: c.FiscalYearVariant || '\u2014'
   }));
-  return buildMmReportResult('buildHrCompanyCodeReport',
+  const report = buildMmReportResult('buildHrCompanyCodeReport',
     `Live S/4HANA API_COMPANYCODE_SRV/A_CompanyCode found ${res.length} real company code record(s).`,
     'Live Company Code Master Data (API_COMPANYCODE_SRV)',
     [{ label: 'Company Codes', value: String(res.length) }],
@@ -11871,8 +12569,10 @@ async function buildHrCompanyCodeReport(query: string): Promise<{ text: string; 
       { key: 'country', label: 'Country' }, { key: 'currency', label: 'Currency' }, { key: 'chartOfAccounts', label: 'Chart of Accounts' }, { key: 'fiscalYearVariant', label: 'Fiscal Year Variant' }
     ],
     rows,
-    'Real live S/4HANA Company Code master data (API_COMPANYCODE_SRV) \u2014 used here for HR organizational/financial context.'
+    'Real live S/4HANA Company Code master data (API_COMPANYCODE_SRV) \u2014 the FI organizational units of this system.'
   );
+  if (rows.length > 25) Object.assign(report.toolResults[0].data, { pageSize: 25, downloadable: true });
+  return report;
 }
 
 // Workforce Daily Availability / Workforce Availability Integration — the standard
@@ -13442,6 +14142,134 @@ function synthesizeLiveDataSummary(results: ToolResult[]): string | null {
 }
 
 // Legacy LLM tools whose handlers return simulated dashboard/demo content instead of live system data.
+// Standard S/4HANA tables for common report topics, passed to the SQL planner as a hint (it still validates them live).
+function reportTableHint(n: string): string {
+  const hints: [RegExp, string][] = [
+    [/vendor\s*invoices?|supplier\s*invoices?|accounts payable/, 'RBKP supplier invoice header (BLDAT, BUDAT, LIFNR, RMWWR gross amount, WAERS, RBSTAT) and RSEG items'],
+    [/maintenance\s*orders?|pm\s*orders?|work\s*orders?/, 'AUFK orders with AUTYP = 30 (maintenance orders: AUFNR, AUART, ERDAT, KTEXT, WERKS) joined with AFIH (IWERK, PRIOK, EQUNR)'],
+    [/production\s*orders?|manufacturing\s*orders?/, 'AUFK orders with AUTYP = 10 joined with AFKO (GAMNG quantity, GSTRP) and AFPO (MATNR, PSMNG, WEMNG)'],
+    [/purchase\s*requisitions?|\bpr\b/, 'EBAN purchase requisitions (BADAT, MATNR, MENGE, PREIS, WERKS, STATU)'],
+    [/purchase\s*orders?|\bpo\b|procurement|purchasing/, 'EKKO purchase order header (BEDAT, LIFNR, EKORG, WAERS, BSART) and EKPO items (MATNR, MENGE, NETWR, WERKS)'],
+    [/maintenance\s*notifications?|notifications?/, 'QMEL notifications (QMNUM, QMART, ERDAT, QMTXT, PRIOK, IWERK)'],
+    [/deliver(y|ies)|shipment|shipping/, 'LIKP delivery header (LFDAT, ERDAT, WADAT_IST, KUNNR, VSTEL, LFART) and LIPS items (MATNR, LFIMG)'],
+    [/goods\s*(movement|receipt|issue)|material\s*documents?|inventory\s*movement/, 'MATDOC material document items (BUDAT, BWART, MATNR, WERKS, MENGE, MEINS, DMBTR, WAERS)'],
+    [/journal|general ledger|\bg\/?l\b|financial postings?|expenses?/, 'ACDOCA universal journal (BUDAT, RACCT, HSL amount, RHCUR, RBUKRS, KOSTL)'],
+    [/freight|transportation/, '/SCMTMS/D_TORROT freight documents (TOR_ID, TOR_CAT, CREATED_ON, LIFECYCLE)'],
+    [/sales\s*orders?|\bsold\b|\borders?\b/, 'VBAK sales order header (AUDAT, ERDAT, NETWR, WAERK, KUNNR, AUART) and VBAP items (MATNR, KWMENG, NETWR)'],
+    [/\bpos\b|point of sale|\bsales\b|\brevenue\b|\bbilling|\binvoic(e|ed|es)\b/, 'VBRK billing document header (FKDAT billing date, NETWR net value, WAERK currency, KUNAG sold-to, FKART type) with VBRP items (MATNR, FKIMG quantity, NETWR); point of sale (POS) means billed sales here'],
+    [/stock|inventory/, 'NSDM_V_MARD stock per storage location (MATNR, WERKS, LGORT, LABST) and MBEW valuation (SALK3, LBKUM)']
+  ];
+  const hit = hints.find(([re]) => re.test(n));
+  return hit ? ` Use the standard tables: ${hit[1]}.` : '';
+}
+
+function isReportRequest(n: string): boolean {
+  return (/\b(generate|create|build|prepare|produce|run|make|provide)\b[\w\s,'&/-]{0,80}\breport\b/.test(n) || /^report\b|\breport\s+(on|of|for|about)\b|\bpos report\b/.test(n))
+    && !/\bhow (to|do|can)\b|\bsteps?\b|\babap\b|\balv\b|\bprogram\b|\bcds\b|\bspec(ification)?\b|\bword\b|\bpdf\b/.test(n);
+}
+
+// True when the question names no period, or the routed rows' dates all fall inside the period it names.
+function routedRowsMatchPeriod(toolResults: ToolResult[], n: string): boolean {
+  const named = /\b(19|20)\d{2}\b|\bthis year\b|\blast year\b|\bytd\b|year to date|\b(last|past|previous)\s+(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(year|month|week|day)s?\b/.test(n);
+  if (!named) return true;
+  const period = parseSalesPeriod(n);
+  const from = `${period.from.slice(0, 4)}-${period.from.slice(4, 6)}-${period.from.slice(6)}`;
+  const to = `${period.to.slice(0, 4)}-${period.to.slice(4, 6)}-${period.to.slice(6)}`;
+  const sets: any[][] = toolResults.map(r => (Array.isArray(r.data) ? r.data : Array.isArray(r.data?.rows) ? r.data.rows : [])).filter(rows => rows.length >= 2);
+  if (!sets.length) return true;
+  const rows = sets.sort((a, b) => b.length - a.length)[0];
+  const toIso = (v: any) => { const s = String(v ?? '').trim(); const m = /^(\d{4})-?(\d{2})-?(\d{2})/.exec(s); return m ? `${m[1]}-${m[2]}-${m[3]}` : null; };
+  const dateKeys = Object.keys(rows[0] || {}).filter(k => rows.filter(x => toIso(x[k])).length >= rows.length * 0.8);
+  if (!dateKeys.length) return true;
+  return dateKeys.some(k => rows.filter(x => { const d = toIso(x[k]); return d && d >= from && d <= to; }).length >= rows.length * 0.9);
+}
+
+function isLiveUpdateRequest(n: string): boolean {
+  return /^(please\s+|can you\s+|could you\s+|kindly\s+)?(update|change|modify|set|correct|amend|edit|adjust|reduce|increase|replace)\b/.test(n)
+    && /\d/.test(n)
+    && !/\bhow (to|do|can)\b|\bsteps?\b|\babap\b|\bprogram\b|\bcode\b|\bclass\b|\bpassword\b|\brole\b|\bkernel\b|\bconfig|\bspro\b/.test(n);
+}
+
+// Plans a field update on a live S/4HANA entity: picks the business object and fields with the LLM, then validates
+// everything against the live $metadata and the live record before registering an approval proposal.
+async function buildLiveUpdateProposal(query: string, onAgentUpdate?: (agent: string, action: string) => void): Promise<{ text: string; toolResults: ToolResult[] } | null> {
+  const fail = (msg: string) => ({ text: msg, toolResults: [{ type: 'live_update_not_possible', toolName: 'liveUpdateAgent', agentName: 'Live Update Agent', data: { reason: msg } } as ToolResult] });
+  let pick: any;
+  try {
+    onAgentUpdate?.('Live Update Agent', 'Identifying the business object, document number and field to change...');
+    const resp = await generateContentWithFallback({
+      model: 'gemini-3.1-flash-lite',
+      contents: [{ role: 'user', parts: [{ text: `Request: "${query}"\n\nUpdatable SAP business objects:\n${UPDATE_TARGETS.map(t => `${t.id} | ${t.module} | ${t.label} | ${t.synonyms}`).join('\n')}` }] }],
+      config: {
+        responseMimeType: 'application/json',
+        systemInstruction: 'You read an SAP change request. Pick the business object it changes from the list (or NONE): choose an ITEM object only when the user names an item/line number or an item-level field like quantity of a line; otherwise choose the header object (e.g. customer reference / PO number of a sales order is header data). Give the document/master-data identifiers exactly as the user wrote them, and each requested change. Return JSON {"target": OBJECT_ID or "NONE", "ids": {"main": the document/master number, "item": item/line number if given, "other": {free-form other identifiers like plant, sales organization, language, company code}}, "changes": [{"field": the field in the user\'s words, "newValue": new value exactly as given (dates as YYYY-MM-DD), "oldValue": stated current value or null}]}. Never invent identifiers or values.'
+      }
+    });
+    const raw = (resp.text || '').trim();
+    pick = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1));
+  } catch (e: any) {
+    console.error('[LIVE UPDATE PLAN ERROR]', e?.message || e);
+    return null;
+  }
+  const target = UPDATE_TARGETS.find(t => t.id === pick?.target);
+  if (!target) return null;
+  const changesAsked: { field: string; newValue: string; oldValue?: string | null }[] = (Array.isArray(pick.changes) ? pick.changes : []).filter((c: any) => c?.field && c?.newValue !== undefined).slice(0, 5);
+  if (!changesAsked.length) return fail(`Please say which field of the ${target.label} should change and the new value (e.g. "... payment terms to 0002").`);
+
+  onAgentUpdate?.('Live Update Agent', `Checking the live SAP metadata of ${target.service}/${target.entitySet} for updatable fields...`);
+  const meta = await fetchEntityMeta(target);
+  if ('error' in meta) return fail(`The ${target.label} cannot be updated live: ${meta.error}. Nothing was changed.`);
+  if (!meta.updatable) return fail(`The ${target.label} (${target.entitySet}) is read-only in this SAP system's API, so it cannot be updated from here. Nothing was changed.`);
+
+  // Map the user's field wording and identifiers to real technical property names of this entity.
+  let mapping: any;
+  try {
+    const resp = await generateContentWithFallback({
+      model: 'gemini-3.1-flash-lite',
+      contents: [{ role: 'user', parts: [{ text: `Request: "${query}"\nIdentifiers given: ${JSON.stringify(pick.ids || {})}\nChanges requested: ${JSON.stringify(changesAsked)}\n\nKey fields of ${target.entitySet}:\n${meta.keys.map(k => `${k.name} | ${k.label} | ${k.type}`).join('\n')}\n\nOther fields (name | label | type | updatable):\n${meta.props.map(p => `${p.name} | ${p.label} | ${p.type} | ${p.updatable ? 'yes' : 'no'}`).join('\n')}` }] }],
+      config: {
+        responseMimeType: 'application/json',
+        systemInstruction: 'Map an SAP change request onto OData field names. Return JSON {"keys": {KeyFieldName: value given by the user}, "changes": [{"property": exact field name from the list or "NONE", "newValue": value converted to the field\'s format (dates YYYY-MM-DD, booleans true/false, numbers without units, codes as given), "oldValue": stated current value or null}]}. Use only field names from the lists and only identifiers the user gave; never invent values.'
+      }
+    });
+    const raw = (resp.text || '').trim();
+    mapping = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1));
+  } catch (e: any) {
+    console.error('[LIVE UPDATE MAPPING ERROR]', e?.message || e);
+    return fail(`The requested change to the ${target.label} could not be interpreted. Please name the field and new value. Nothing was changed.`);
+  }
+
+  const changes: { prop: PropMeta; value: any; display: string }[] = [];
+  const problems: string[] = [];
+  for (const c of (Array.isArray(mapping?.changes) ? mapping.changes : [])) {
+    const prop = meta.props.find(p => p.name === c?.property);
+    if (!prop) { problems.push(`no field of the ${target.label} matches "${changesAsked[changes.length + problems.length]?.field || c?.property}"`); continue; }
+    if (!prop.updatable) { problems.push(`${prop.label || prop.name} (${prop.name}) cannot be changed through the SAP API`); continue; }
+    const conv = toODataValue(prop, String(c.newValue ?? ''));
+    if (conv.error) { problems.push(`${prop.label || prop.name}: ${conv.error}`); continue; }
+    changes.push({ prop, value: conv.value, display: String(c.newValue ?? '') === '' ? '(blank)' : String(c.newValue) });
+    (changes[changes.length - 1] as any).oldValue = c.oldValue;
+  }
+  if (!changes.length) return fail(`The change could not be prepared: ${problems.join('; ') || 'no updatable field matched'}. Nothing was changed.`);
+
+  onAgentUpdate?.('Live Update Agent', `Reading the current live ${target.label}...`);
+  const rec = await readLiveRecord(target, meta, mapping?.keys || {});
+  if ('error' in rec) return fail(`The ${target.label} could not be found for the update: ${rec.error}. Nothing was changed.`);
+  const mismatch = changes.filter((c: any) => c.oldValue !== null && c.oldValue !== undefined && String(c.oldValue).trim() !== '' && Number.isFinite(Number(c.oldValue)) && Number(rec.record[c.prop.name]) !== Number(c.oldValue));
+  if (mismatch.length) {
+    return fail(`Nothing was changed: ${mismatch.map((c: any) => `${c.prop.label || c.prop.name} is currently ${rec.record[c.prop.name]}, not ${c.oldValue}`).join('; ')}.`);
+  }
+  const unchanged = changes.filter(c => String(rec.record[c.prop.name] ?? '') === String(c.value ?? ''));
+  if (unchanged.length === changes.length) return fail(`Nothing to change: ${changes.map(c => `${c.prop.label || c.prop.name} is already ${c.display}`).join('; ')}.`);
+
+  const proposal = registerLiveUpdateProposal(target, rec.keyPredicate, rec.record, changes);
+  return {
+    text: `Live update prepared for ${target.label} ${rec.keyPredicate.replace(/'/g, '')} [${target.module}] \u2014 ${changes.map(c => `${c.prop.label || c.prop.name}: ${rec.record[c.prop.name] ?? '(empty)'} \u2192 ${c.display}`).join('; ')}. Nothing is written to SAP until you approve below.${problems.length ? ` Not included: ${problems.join('; ')}.` : ''}`,
+    toolResults: [{ type: 'live_update_approval_request', toolName: 'liveUpdateAgent', agentName: 'Live Update Agent', data: proposal } as ToolResult]
+  };
+}
+
+// Legacy LLM tools whose handlers return simulated dashboard/demo content instead of live system data.
 const SIMULATED_TOOL_NAMES = new Set([
   'getSapBasisSystemMetrics', 'triggerSapSystemHealthCheck', 'executeAutonomousBasisAgent', 'getBasisExecutiveQuestionAnswer', 'getBasisExecutiveQueryInsightsReport',
   'getAbapDumps', 'getSapAgents', 'getSproConfigurations', 'getSecurityAuditLogs', 'getSecurityExecutiveQuestionAnswer', 'getSecurityExecutiveQueryInsightsReport',
@@ -13538,7 +14366,143 @@ export async function processSapQuery(
   images?: { name: string; type: string; data: string }[],
   backendTarget: SapBackendTarget = 'BOTH'
 ): Promise<{ text: string; toolResults: ToolResult[] }> {
+  const result = await processSapQueryRouted(query, userRole, history, onAgentUpdate, images, backendTarget);
+  if ((result as any).preRouted) return result;
+  const n = normalizeSdPrompt(query);
+  // "Generate a report ..." on any module/topic: always end with a KPI dashboard built from live rows for the asked period.
+  if (backendTarget !== 'ECC' && !(images && images.length > 0) && isReportRequest(n)) {
+    try {
+      const routedDash: any = buildKpiDashboard(query, result.toolResults || []);
+      // KPIs come only from a complete dataset: a routed report qualifies only if it read every page.
+      const completeSource = (result.toolResults || []).find(r => r?.data?.completeDataset === true);
+      const usable = routedDash && completeSource && (routedDash.data.trend || routedDash.data.top) && !/\bsampled\b/i.test(result.text || '') && routedRowsMatchPeriod(result.toolResults || [], n);
+      if (usable) {
+        onAgentUpdate?.('Report Analytics', 'Building KPI tiles and charts from the complete live report data...');
+        const srcRows: any[] = Array.isArray(routedDash.source?.data) ? routedDash.source.data : routedDash.source?.data?.rows || [];
+        const srcCols = Array.isArray(routedDash.source?.data?.columns) ? routedDash.source.data.columns : Object.keys(srcRows[0] || {}).filter(k => k !== '__metadata').map(k => ({ key: k, label: k.replace(/([a-z])([A-Z])/g, '$1 $2') }));
+        attachCompleteDatasetMeta(routedDash, `Live S/4HANA (${completeSource.toolName || 'OData'})`, String(completeSource.data?.note || ''), srcRows.length, { columns: srcCols, rows: srcRows });
+        return { ...result, toolResults: [...result.toolResults.slice(0, 1), routedDash as ToolResult, ...result.toolResults.slice(1)] };
+      }
+      onAgentUpdate?.('Report Generator', 'Building the report from a dedicated read-only query on the live S/4HANA data for the requested topic and period...');
+      const gen = await buildHanaDbIntelligenceReport(
+        `${query}\n(Report request: return one row per business document or record, not only a total, with its date, its main amount or quantity and the currency/unit, and its main business partner, material, plant, type or status columns; order by the most relevant measure, descending.${reportTableHint(n)})`,
+        onAgentUpdate,
+        { maxRows: 5000, reportTitle: `Report \u2014 ${query.trim().replace(/^(please\s+)?(generate|create|build|prepare|produce|run|make)\s+(me\s+)?(an?\s+)?/i, '').slice(0, 90)}` }
+      );
+      const genTable = gen.toolResults.find(r => r.type === 'hana_db_intelligence_report');
+      if (genTable && Array.isArray(genTable.data?.rows) && genTable.data.rows.length > 0) {
+        const genDash: any = buildKpiDashboard(query, gen.toolResults);
+        let dashboard: any = null;
+        let text = gen.text;
+        if (genDash) {
+          onAgentUpdate?.('Report Analytics', `Aggregating KPIs in SAP over all ${Number(genTable.data.totalRows || genTable.data.rows.length).toLocaleString('en-US')} matching records (COUNT / SUM / GROUP BY)...`);
+          const pop = await buildPopulationKpiDashboard(query, genDash, genTable);
+          if (!('error' in pop)) { dashboard = pop.dashboard; text = pop.text; }
+          else if (Number(genTable.data.totalRows || 0) <= genTable.data.rows.length) {
+            dashboard = attachCompleteDatasetMeta(genDash, String(genTable.data.sourceSystem || 'Live S/4HANA database'), String(genTable.data.sqlExecuted || '').replace(/\s+/g, ' ').slice(0, 400), genTable.data.rows.length, { columns: genTable.data.columns || [], rows: genTable.data.rows.slice(0, 5000) });
+          } else {
+            text += ` No KPI dashboard is shown: the KPIs could not be aggregated over all ${Number(genTable.data.totalRows).toLocaleString('en-US')} matching records (${pop.error}), and they are never computed from a partial set.`;
+          }
+        }
+        genTable.data.rows = genTable.data.rows.slice(0, 200);
+        return { text, toolResults: dashboard ? [dashboard as ToolResult, ...gen.toolResults] : gen.toolResults };
+      }
+      return result;
+    } catch (e: any) {
+      console.error('[REPORT GENERATOR ERROR]', e?.message || e);
+    }
+  }
+  // "... dashboard / chart": add KPI tiles and charts computed from the live rows already returned.
+  try {
+    let dashboard: any = buildKpiDashboard(query, result.toolResults || []);
+    const src = dashboard?.source;
+    const srcRows = Array.isArray(src?.data) ? src.data.length : Array.isArray(src?.data?.rows) ? src.data.rows.length : 0;
+    if (dashboard && Number(src?.data?.totalRows) > srcRows) {
+      // The rows are only part of the matching data: aggregate in SAP, or show no KPIs at all.
+      const pop = src?.type === 'hana_db_intelligence_report' ? await buildPopulationKpiDashboard(query, dashboard, src) : null;
+      dashboard = pop && !('error' in pop) ? pop.dashboard : null;
+    }
+    if (dashboard) {
+      onAgentUpdate?.('Report Analytics', 'Building KPI tiles and charts from the live report data...');
+      return { ...result, toolResults: [...result.toolResults.slice(0, 1), dashboard as ToolResult, ...result.toolResults.slice(1)] };
+    }
+  } catch (e: any) {
+    console.error('[KPI DASHBOARD ERROR]', e?.message || e);
+  }
+  return result;
+}
+
+// Business scenarios, pasted-code explanations and solution designs answered before the module pipeline.
+async function runPreRoutedScenario(
+  query: string, backendTarget: SapBackendTarget, onAgentUpdate?: (agent: string, action: string) => void,
+  userRole?: UserRole, history: Message[] = []
+): Promise<{ text: string; toolResults: ToolResult[] } | null> {
+  try {
+    const pasted = extractPastedAbapCode(query);
+    if (pasted && /\b(what does|explain|walk me through|review|analy[sz]e|what is this)\b/i.test(query.slice(0, Math.max(200, query.indexOf(pasted))))) {
+      onAgentUpdate?.('Intent + Entity Resolution', 'Matched explanation of pasted ABAP source code.');
+      onAgentUpdate?.(AGENTS.ABAP_LIVE_AGENT.name, 'Checking every table, field and function module of the pasted code against the live system...');
+      const r = await buildPastedAbapExplanation(query, pasted, backendTarget);
+      if (r) return r;
+    }
+    if (isSolutionDesignRequest(query)) {
+      onAgentUpdate?.('Intent + Entity Resolution', 'Matched a solution architecture / BTP design request.');
+      const r = await buildSolutionDesignAnswer(query, backendTarget, onAgentUpdate);
+      if (r) return r;
+    }
+    if (isSapKnowledgeHubQuestion(query)) {
+      onAgentUpdate?.('Intent + Entity Resolution', 'Matched an SAP knowledge / support question — no live business data is needed.');
+      onAgentUpdate?.('Agent Router', 'Routed to the SAP Knowledge Hub Agent (SAP standard know-how, separate from the live data agents).');
+      onAgentUpdate?.('SAP Knowledge Hub Agent', 'Composing the explanation with process steps, T-codes, tables and configuration...');
+      return await buildSapKnowledgeHubAnswer(query, userRole || ('Functional Consultant' as UserRole), backendTarget, history);
+    }
+    if (backendTarget === 'ECC') return null;
+    const intent = classifyScenarioIntent(query);
+    if (!intent) return null;
+    onAgentUpdate?.('Intent + Entity Resolution', `Matched business scenario ${intent}.`);
+    onAgentUpdate?.('Agent Router', `Routed to ${SCENARIO_AGENT[intent]} \u2014 reading live S/4HANA tables (read-only).`);
+    const llm = async (systemInstruction: string, prompt: string) => {
+      const resp = await generateContentWithFallback({ model: 'gemini-3.1-flash-lite', contents: [{ role: 'user', parts: [{ text: prompt }] }], config: { systemInstruction } });
+      return (resp.text || '').trim();
+    };
+    const r = await runScenario(intent, query, llm);
+    if (r) {
+      onAgentUpdate?.('Data Validation', 'Verified every figure against the live S/4HANA tables; no synthetic or fallback data.');
+      onAgentUpdate?.('Natural-Language Answer + Table/Chart', 'Composing the answer with supporting live tables...');
+    }
+    return r;
+  } catch (e: any) {
+    console.error('[SCENARIO ROUTER ERROR]', e?.message || e);
+    return null;
+  }
+}
+
+async function processSapQueryRouted(
+  query: string,
+  userRole: UserRole,
+  history: Message[] = [],
+  onAgentUpdate?: (agent: string, action: string) => void,
+  images?: { name: string; type: string; data: string }[],
+  backendTarget: SapBackendTarget = 'BOTH'
+): Promise<{ text: string; toolResults: ToolResult[] }> {
+  const pre = !(images && images.length > 0) ? await runPreRoutedScenario(query, backendTarget, onAgentUpdate, userRole, history) : null;
+  if (pre) {
+    // Complete answers on their own: the report/dashboard post-processing must not reshape them.
+    Object.defineProperty(pre, 'preRouted', { value: true, enumerable: false });
+    return pre;
+  }
   const result = await processSapQueryCore(query, userRole, history, onAgentUpdate, images, backendTarget);
+  // Update/change requests that no module action handler turned into an approval proposal go to the cross-module live update agent.
+  if (backendTarget !== 'ECC' && !(images && images.length > 0) && isLiveUpdateRequest(normalizeSdPrompt(query))
+      && !result.toolResults.some(r => /_approval_request$|_action_result$/.test(String(r.type || '')))) {
+    try {
+      onAgentUpdate?.('Intent + Entity Resolution', 'Matched live update request \u2014 routing to the cross-module Live Update Agent.');
+      const update = await buildLiveUpdateProposal(query, onAgentUpdate);
+      if (update) return update;
+    } catch (e: any) {
+      console.error('[LIVE UPDATE AGENT ERROR]', e?.message || e);
+    }
+  }
   // A keyword intercept answered "not available live": check whether the question's meaning maps to a live data service.
   const onlyUnavailable = result.toolResults.length > 0 && result.toolResults.every(r => r.type === 'fico_service_unavailable');
   if (!onlyUnavailable || backendTarget === 'ECC' || (images && images.length > 0)) return result;
@@ -13761,12 +14725,23 @@ async function processSapQueryCore(
       const html = renderAbapSpecDocument(facts, narrative, verified);
       const found = verified.filter(v => v.exists === 'Yes');
       const lines = facts.units.reduce((a, u) => a + u.lines, 0);
-      const text = `Technical and functional specification for ${facts.name}${facts.title ? ` ("${facts.title}")` : ''} has been prepared from its live source (${lines} lines), ${facts.tables.length} database tables, ${facts.functions.length} function module/BAPI call(s) and ${facts.transports.length} transport(s). Download the Word document below.\n\n**S/4HANA standard functionality:** ${narrative?.s4Standard?.verdict || 'not determined'}. ${narrative?.s4Standard?.explanation || ''}${found.length ? ` Standard objects confirmed to exist in this system: ${found.map(v => `${v.name} (${v.type}${v.systemText ? ` – ${v.systemText}` : ''})`).join(', ')}.` : ''}${verified.some(v => v.exists === 'No') ? ` Not found in this system: ${verified.filter(v => v.exists === 'No').map(v => v.name).join(', ')}.` : ''}${facts.simplification.length ? `\n\n**S/4HANA simplification impact:** ${facts.simplification.map(s => `${s.table} – ${s.impact}`).join('; ')}.` : ''}${narrative?.recommendation ? `\n\n**Recommendation:** ${narrative.recommendation}` : ''}`;
+      const specText = `Technical and functional specification for ${facts.name}${facts.title ? ` ("${facts.title}")` : ''} has been prepared from its live source (${lines} lines), ${facts.tables.length} database tables, ${facts.functions.length} function module/BAPI call(s) and ${facts.transports.length} transport(s). Download the Word document below.\n\n**S/4HANA standard functionality:** ${narrative?.s4Standard?.verdict || 'not determined'}. ${narrative?.s4Standard?.explanation || ''}${found.length ? ` Standard objects confirmed to exist in this system: ${found.map(v => `${v.name} (${v.type}${v.systemText ? ` – ${v.systemText}` : ''})`).join(', ')}.` : ''}${verified.some(v => v.exists === 'No') ? ` Not found in this system: ${verified.filter(v => v.exists === 'No').map(v => v.name).join(', ')}.` : ''}${facts.simplification.length ? `\n\n**S/4HANA simplification impact:** ${facts.simplification.map(s => `${s.table} – ${s.impact}`).join('; ')}.` : ''}${narrative?.recommendation ? `\n\n**Recommendation:** ${narrative.recommendation}` : ''}`;
+      const [modernized, flowPlan] = await Promise.all([
+        addAbapModernizationRecommendations(query, facts, narrative, verified, html, onAgentUpdate),
+        generateAbapFlowPlan(facts, narrative)
+      ]);
+      let specDoc = modernized.html;
+      try {
+        specDoc = decorateAbapSpecDocument(modernized.html, facts, narrative, flowPlan);
+      } catch (e: any) {
+        console.error('[ABAP SPEC FLOW DIAGRAM ERROR]', e?.message || e);
+      }
+      const text = `${specText}${modernized.summary ? `\n\n**Fit-to-Standard & S/4HANA modernization (added to the document):** ${modernized.summary}` : ''}`;
       emitClosingPipelineStages();
       return {
         text,
         toolResults: [
-          { type: 'download_doc', toolName: 'abapSpecDocument', agentName: AGENTS.ABAP_LIVE_AGENT.name, data: { content: html, filename: `${facts.name}_Technical_Functional_Specification.doc` } } as ToolResult,
+          { type: 'download_doc', toolName: 'abapSpecDocument', agentName: AGENTS.ABAP_LIVE_AGENT.name, data: { content: specDoc, filename: `${facts.name}_Technical_Functional_Specification.doc` } } as ToolResult,
           ...abapSpecSections(facts, verified).map(abapSectionToolResult)
         ]
       };
@@ -13944,6 +14919,7 @@ async function processSapQueryCore(
       // (which returns first), so no additional exclusion is needed on this line.
       if (has('create') && (n.includes('sales order') || (n.includes('order') && !n.includes('return')))) return 'CREATE_SALES_ORDER';
       if (has('change') && n.includes('order') && !n.includes('deliver')) return 'CHANGE_SALES_ORDER';
+      if (/\b(update|change|reduce|increase|set|modify|adjust)\b/.test(n) && /\bdelivery\b/.test(n) && /\bquantit|\bqty\b/.test(n)) return 'CHANGE_DELIVERY_QUANTITY';
       if (has('cancel') && n.includes('order')) return 'CANCEL_ORDER';
       if (has('remove') && n.includes('delivery block')) return 'REMOVE_DELIVERY_BLOCK';
       if (has('release') && n.includes('billing block')) return 'RELEASE_BILLING_BLOCK';
@@ -14037,6 +15013,18 @@ async function processSapQueryCore(
             if (!deliveryId) { emitClosingPipelineStages(); return { text: `Please specify the Delivery Document number for "${catalogEntry.title}" (e.g. "Change delivery priority on delivery 80001234 to 02").`, toolResults: [] }; }
             proposal = await proposeSensitiveSdAction(sdActionType, { deliveryId, newPriority: query.match(/\bto\s+(\d{2})\b/i)?.[1] || query.match(/priorit\w*\D*(\d{2})\b/i)?.[1] || '02' });
             break;
+          case 'CHANGE_DELIVERY_QUANTITY': {
+            const qtyTo = query.match(/\bto\s+(\d+(?:\.\d+)?)\b/i);
+            if (!deliveryId || !qtyTo) { emitClosingPipelineStages(); return { text: `Please give the delivery number and the new quantity (e.g. "Update delivery 80006980 quantity from 5 to 3" or "Change delivery 80006980 item 10 quantity to 3").`, toolResults: [] }; }
+            const qtyFrom = query.match(/\bfrom\s+(\d+(?:\.\d+)?)\s+to\b/i);
+            proposal = await proposeSensitiveSdAction(sdActionType, {
+              deliveryId,
+              newQuantity: Number(qtyTo[1]),
+              fromQuantity: qtyFrom ? Number(qtyFrom[1]) : undefined,
+              itemNo: query.match(/\bitem\s*(?:no\.?|number|#)?\s*(\d{1,6})\b/i)?.[1]
+            });
+            break;
+          }
           case 'CHANGE_SALES_ORDER': {
             if (!orderId) { emitClosingPipelineStages(); return { text: `Please specify the Sales Order number for "${catalogEntry.title}".`, toolResults: [] }; }
             const poMatch = query.match(/purchase order\s*(?:reference|number|#)?\s*(?:to|=)?\s*['"]?([A-Za-z0-9\-]+)['"]?/i);
@@ -14437,28 +15425,115 @@ async function processSapQueryCore(
     // a Sales Order list (mostly Open/Pending) instead of real cleared invoices. Real fix: route
     // to genuinely paid/cleared billing documents (InvoiceClearingStatus eq 'C'), scoped to last
     // month's real BillingDocumentDate when that period is named.
+    const isPaidVendorInvoiceAsk = /\b(vendors?|suppliers?|payables?|ap)\b|accounts payable/.test(normalizedForReport);
     if (
       backendTarget !== 'ECC' && !images?.length &&
       normalizedForReport.includes('invoice') &&
       normalizedForReport.includes('paid') &&
-      !normalizedForReport.includes('not paid') && !normalizedForReport.includes('unpaid')
+      !normalizedForReport.includes('not paid') && !normalizedForReport.includes('unpaid') &&
+      isPaidVendorInvoiceAsk
     ) {
-      const period: 'last month' | 'this month' | 'all' = normalizedForReport.includes('last month')
+      const yearMatch = normalizedForReport.match(/\b(20\d{2})\b/);
+      const sysYear = new Date().getUTCFullYear();
+      const period: 'last month' | 'this month' | 'all' | { year: number } = normalizedForReport.includes('last month')
         ? 'last month'
-        : normalizedForReport.includes('this month') ? 'this month' : 'all';
+        : normalizedForReport.includes('this month') ? 'this month'
+        : yearMatch ? { year: Number(yearMatch[1]) }
+        : normalizedForReport.includes('this year') ? { year: sysYear }
+        : normalizedForReport.includes('last year') ? { year: sysYear - 1 } : 'all';
+      onAgentUpdate?.('Intent + Entity Resolution', `Matched live paid vendor (accounts payable) invoices intent for query "${truncatedQueryPreview}".`);
+      onAgentUpdate?.('SAP Metadata/Semantic Catalog', 'Resolved semantic mapping to cleared supplier items (BSAK) with their payment documents.');
+      onAgentUpdate?.('Agent Router', 'Routed to FI/CO Live Agent for live paid vendor invoice retrieval.');
+      onAgentUpdate?.(AGENTS.FICO_LIVE_AGENT.name, `Building live paid vendor invoices report (${typeof period === 'object' ? period.year : period})...`);
+      const apReport = await buildPaidVendorInvoicesReport(period);
+      if (apReport) {
+        const rowCount = Array.isArray(apReport.toolResults[apReport.toolResults.length - 1]?.data) ? apReport.toolResults[apReport.toolResults.length - 1].data.length : undefined;
+        emitClosingPipelineStages(rowCount);
+        return apReport;
+      }
+    }
+    if (
+      backendTarget !== 'ECC' && !images?.length &&
+      normalizedForReport.includes('invoice') &&
+      normalizedForReport.includes('paid') &&
+      !normalizedForReport.includes('not paid') && !normalizedForReport.includes('unpaid') &&
+      !isPaidVendorInvoiceAsk
+    ) {
+      const yearMatch = normalizedForReport.match(/\b(20\d{2})\b/);
+      const sysYear = new Date().getUTCFullYear();
+      const period: 'last month' | 'this month' | 'all' | { year: number } = normalizedForReport.includes('last month')
+        ? 'last month'
+        : normalizedForReport.includes('this month') ? 'this month'
+        : yearMatch ? { year: Number(yearMatch[1]) }
+        : normalizedForReport.includes('this year') ? { year: sysYear }
+        : normalizedForReport.includes('last year') ? { year: sysYear - 1 } : 'all';
       onAgentUpdate?.('Intent + Entity Resolution', `Matched live paid-invoices intent for query "${truncatedQueryPreview}".`);
       onAgentUpdate?.('SAP Metadata/Semantic Catalog', 'Resolved semantic mapping to live Billing Document header, filtered to genuinely cleared/paid invoices.');
       onAgentUpdate?.('Agent Router', 'Routed to SD Orchestrator Agent for live paid-invoice retrieval.');
-      onAgentUpdate?.(AGENTS.SD_ORCHESTRATOR.name, `Building live paid invoices report (${period})...`);
+      onAgentUpdate?.(AGENTS.SD_ORCHESTRATOR.name, `Building live paid invoices report (${typeof period === 'object' ? period.year : period})...`);
       const paidReport = await buildPaidInvoicesReport(period);
       if (paidReport) {
-        const rowCount = Array.isArray(paidReport.toolResults[0]?.data) ? paidReport.toolResults[0].data.length : undefined;
+        const rowCount = Array.isArray(paidReport.toolResults[paidReport.toolResults.length - 1]?.data) ? paidReport.toolResults[paidReport.toolResults.length - 1].data.length : undefined;
         emitClosingPipelineStages(rowCount);
         return paidReport;
       }
     }
 
-    const isO2CFunnelIntent = backendTarget !== 'ECC' && !images?.length && (
+    // "2026 deliveries": outbound deliveries restricted to a named calendar year (not warehouse/EWM orders, not inbound, not how-to).
+    const deliveryYearMatch = normalizedForReport.match(/\b(20\d{2})\b/);
+    const deliveryYear = deliveryYearMatch ? Number(deliveryYearMatch[1])
+      : normalizedForReport.includes('this year') ? new Date().getUTCFullYear()
+      : normalizedForReport.includes('last year') ? new Date().getUTCFullYear() - 1 : null;
+    if (
+      backendTarget !== 'ECC' && !images?.length && deliveryYear &&
+      /\bdeliver(y|ies)\b/.test(normalizedForReport) &&
+      !/\binbound\b|\bwarehouse\b|\bewm\b|delivery order|\bfreight\b|\bidoc|\bhow (to|do|can)\b|\bsteps?\b|\blate\b|\bdelay/.test(normalizedForReport)
+    ) {
+      const basis: 'delivery' | 'created' | 'goods issue' = /\bcreated\b|\bcreation\b/.test(normalizedForReport) ? 'created'
+        : /goods issue|\bpgi\b|\bshipped\b/.test(normalizedForReport) ? 'goods issue' : 'delivery';
+      onAgentUpdate?.('Intent + Entity Resolution', `Matched live outbound deliveries for year ${deliveryYear} (${basis} date) for query "${truncatedQueryPreview}".`);
+      onAgentUpdate?.(AGENTS.SD_ORCHESTRATOR.name, `Reading all live outbound deliveries of ${deliveryYear} from API_OUTBOUND_DELIVERY_SRV...`);
+      const deliveryReport = await buildDeliveriesForYearReport(deliveryYear, basis);
+      if (deliveryReport) {
+        emitClosingPipelineStages(deliveryReport.toolResults[0]?.data?.rows?.length);
+        return deliveryReport;
+      }
+    }
+
+    // "Best-selling / top-selling / most sold material(s)" over a period, from live billing documents.
+    if (
+      backendTarget !== 'ECC' && !images?.length &&
+      /\bbest[\s-]?sell|\btop[\s-]?sell|\btop\s+\d+\s+(best[\s-]?)?selling\b|\bmost[\s-]?(sold|selling)\b|\bfastest[\s-]?selling\b|\bbest[\s-]?performing (material|product)|\btop (\d+ )?(materials?|products?) by (sales|revenue|quantity)/.test(normalizedForReport) &&
+      !/\bcustomers?\b|\bhow (to|do|can)\b|\bsteps?\b/.test(normalizedForReport)
+    ) {
+      onAgentUpdate?.('Intent + Entity Resolution', `Matched best-selling materials intent for query "${truncatedQueryPreview}".`);
+      onAgentUpdate?.(AGENTS.SD_ORCHESTRATOR.name, 'Aggregating billed quantity and net sales per material from live billing documents (VBRK/VBRP)...');
+      const bestReport = await buildBestSellingMaterialsReport(query);
+      if (bestReport) {
+        emitClosingPipelineStages(bestReport.toolResults[0]?.data?.rows?.length);
+        return bestReport;
+      }
+    }
+
+    // "Line items of PO 4500000001": every item of one named purchase order (read only; update requests go to the action handlers).
+    const poItemsMatch = query.match(/\b(?:p\.?o\.?|purchase\s*order)\s*(?:#|no\.?|number)?\s*[:#]?\s*(\d{6,10})\b/i);
+    if (
+      backendTarget !== 'ECC' && !images?.length && poItemsMatch &&
+      /\b(line\s*items?|items?|lines?|positions?)\b/.test(normalizedForReport) &&
+      !/\b(update|change|modify|set|create|delete|cancel|reduce|increase|adjust|approve|release)\b/.test(normalizedForReport)
+    ) {
+      onAgentUpdate?.('Intent + Entity Resolution', `Matched purchase order line items for PO ${poItemsMatch[1]}.`);
+      onAgentUpdate?.(AGENTS.MM_LIVE_AGENT.name, `Reading all live line items of purchase order ${poItemsMatch[1]}...`);
+      const poItemsReport = await buildPurchaseOrderItemsReport(poItemsMatch[1]);
+      if (poItemsReport) {
+        emitClosingPipelineStages(poItemsReport.toolResults[0]?.data?.rows?.length);
+        return poItemsReport;
+      }
+    }
+
+    const isO2CFunnelIntent = backendTarget !== 'ECC' && !images?.length &&
+      // ABAP code-writing requests that merely mention O2C belong to the ABAP code-generation handler further down.
+      !(/\babap\b/.test(normalizedForReport) && /\b(write|create|generate|build|convert)\b/.test(normalizedForReport)) && (
       normalizedForReport.includes('order to cash') ||
       normalizedForReport.includes('order-to-cash') ||
       normalizedForReport.includes(' o2c') ||
@@ -15676,13 +16751,15 @@ async function processSapQueryCore(
       const isAbapCodeGenNoun = ncg.includes('abap program') || ncg.includes('abap report') || ncg.includes('abap class') || ncg.includes('abap code') ||
         (ncg.includes('abap') && ncg.includes('report') && !ncg.includes('dump')) ||
         ncg.includes('cds view') || ncg.includes('alv report') || ncg.includes('odata service') || ncg.includes('badi') ||
+        ncg.includes('behavior definition') || ncg.includes('behaviour definition') || (ncg.includes('cds') && ncg.includes('data model')) ||
+        ncg.includes('rap-based') || ncg.includes('rap based') || ncg.includes('rap business object') ||
         ncg.includes('unit test') || ncg.includes('rap service') || ncg.includes('abap rap') ||
         (ncg.includes('rest api') && ncg.includes('call')) || ncg.includes('object-oriented') || ncg.includes('object oriented');
       if (isAbapCodeGenVerb && isAbapCodeGenNoun) {
         onAgentUpdate?.('Intent + Entity Resolution', `Matched ABAP code-generation intent for query "${truncatedQueryPreview}".`);
         onAgentUpdate?.('Agent Router', 'Routed to S/4HANA ABAP Agent for AI code-proposal generation.');
         onAgentUpdate?.(AGENTS.ABAP_LIVE_AGENT.name, 'Generating AI ABAP code proposal (not yet created live)...');
-        const codeGenReport = await buildAbapCodeGenerationReport(query);
+        const codeGenReport = await buildAbapCodeGenerationReport(query) || await buildAbapCodeGenerationReport(query);
         if (codeGenReport) {
           emitClosingPipelineStages();
           return backendTarget !== 'ECC' ? await withLiveAbapCodeCheck(codeGenReport) : codeGenReport;
