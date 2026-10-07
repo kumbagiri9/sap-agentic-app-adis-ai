@@ -33,6 +33,7 @@ import {
   AbapUnitResult
 } from '../types';
 import { ppService } from '../services/ppService';
+import { Va01CreateSalesOrder } from './Va01CreateSalesOrder';
 import { 
   SalesOrderForm,
   PurchaseOrderForm,
@@ -5187,6 +5188,9 @@ export const GuiScreenCard: React.FC<{ data: GuiCardType }> = ({ data }) => {
           const cust = params.customer || params.soldTo || params.soldToParty || params.customerId;
           const po = params.poRef || params.poNumber || params.po;
           const org = params.salesOrg || params.salesOrganization;
+          if ((data.tCode || '').toLowerCase() === 'va01' || titleLower.includes('create')) {
+            return <Va01CreateSalesOrder initial={{ soldTo: cust, poRef: po, salesOrg: org, material: params.material, quantity: params.quantity }} />;
+          }
           return <SalesOrderForm initialCustomer={cust} initialPoRef={po} initialSalesOrg={org} />;
         }
         if (titleLower.includes('purchase order') || ['me21n', 'me23n'].includes((data.tCode || '').toLowerCase())) {

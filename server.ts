@@ -270,6 +270,35 @@ async function startServer() {
     res.json(result);
   });
 
+  // VA01 Create Standard Order screen: live value helps, master-data checks and the live create (audited).
+  app.get("/api/s4/va01/value-help", async (_req, res) => {
+    try {
+      const { getVa01ValueHelps } = await import("./services/va01Service");
+      res.json({ success: true, ...(await getVa01ValueHelps()) });
+    } catch (e: any) {
+      res.json({ success: false, message: e?.message || String(e) });
+    }
+  });
+  app.post("/api/s4/va01/check", async (req, res) => {
+    try {
+      const { kind, id, salesOrg, distChannel, division } = req.body || {};
+      const { checkVa01Entity } = await import("./services/va01Service");
+      res.json(await checkVa01Entity(String(kind || ''), String(id || ''), salesOrg, distChannel, division));
+    } catch (e: any) {
+      res.json({ found: false, message: e?.message || String(e) });
+    }
+  });
+  app.post("/api/s4/va01/create", async (req, res) => {
+    try {
+      const { createVa01SalesOrder } = await import("./services/va01Service");
+      const result = await createVa01SalesOrder(req.body || {});
+      appendAudit({ timestamp: new Date().toISOString(), event: 'va01_create_sales_order', success: result.success, salesOrder: (result as any).salesOrder || null, soldTo: req.body?.soldTo, message: String(result.message || '').slice(0, 400) });
+      res.json(result);
+    } catch (e: any) {
+      res.json({ success: false, message: e?.message || String(e) });
+    }
+  });
+
   // FICO Autonomous Actions — human approval decision on a live S/4HANA write proposal
   app.post("/api/fico-action/decide", async (req, res) => {
     const { proposalId, decision } = req.body;
